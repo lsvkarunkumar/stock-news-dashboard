@@ -1,12 +1,30 @@
 import datetime as dt
+import json
 import requests
-import pandas as pd
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
+def _gdelt_request(params: dict):
+    r = requests.get(
+        GDELT_DOC_URL,
+        params=params,
+        timeout=60,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    r.raise_for_status()
+
+    # Sometimes GDELT returns non-JSON (HTML error page, rate limit, etc.)
+    try:
+        return r.json()
+    except Exception:
+        # best-effort fallback: try to parse text if it's JSON-looking
+        txt = (r.text or "").strip()
+        try:
+            return json.loads(txt)
+        except Exception:
+            return None
+
 def gdelt_mentions(query: str, start: dt.date, end: dt.date) -> int:
-    # Using DOC API with "mode=timelinevolraw" would be ideal, but simplest: count via "format=json" with maxrecords=1
-    # We'll use "format=json&maxrecords=1&format=json&mode=artlist" and read "totalrecords" if present.
     params = {
         "query": query,
         "mode": "artlist",
@@ -16,10 +34,10 @@ def gdelt_mentions(query: str, start: dt.date, end: dt.date) -> int:
         "maxrecords": 1,
         "sort": "datedesc",
     }
-    r = requests.get(GDELT_DOC_URL, params=params, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    js = r.json()
-    return int(js.get("totalRecords", 0))
+    js = _gdelt_request(params)
+    if not js:
+        return 0
+    return int(js.get("totalRecords", 0) or 0)
 
 def gdelt_latest_headline(query: str, start: dt.date, end: dt.date):
     params = {
@@ -31,9 +49,9 @@ def gdelt_latest_headline(query: str, start: dt.date, end: dt.date):
         "maxrecords": 1,
         "sort": "datedesc",
     }
-    r = requests.get(GDELT_DOC_URL, params=params, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    js = r.json()
+    js = _gdelt_request(params)
+    if not js:
+        return None, None
     arts = js.get("articles", []) or []
     if not arts:
         return None, None
@@ -41,8 +59,6 @@ def gdelt_latest_headline(query: str, start: dt.date, end: dt.date):
     return a.get("title"), a.get("url")
 
 def build_company_query(symbol: str, name: str) -> str:
-    # Keep it simple in V1: use company name + symbol
-    # You can add synonyms later (eg "Vodafone Idea" OR "Vi")
     safe_name = (name or "").replace('"', "")
     safe_symbol = (symbol or "").replace('"', "")
     if safe_name and safe_symbol:
