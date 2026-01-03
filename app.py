@@ -28,14 +28,14 @@ def load_css():
 init_db()
 load_css()
 
-st.title("🧠 News × Price Watchlist (Auto-updated)")
-st.caption("Educational dashboard. Final decision is yours.")
+st.title("🧠 News × Price Dashboard")
+st.caption("Auto-updated watchlist with news intensity & price context (educational). Final decision is yours.")
 
 with st.sidebar:
     st.header("Controls")
     page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=0)
     st.divider()
-    st.caption("GitHub Actions still refreshes in background every 6 hours. App also refreshes instantly when you add/view stocks.")
+    st.caption("Prices are near-real-time via free data sources (may be delayed).")
 
 # ---------------- Helpers ----------------
 def is_valid_url(x):
@@ -145,7 +145,7 @@ def get_latest_signals_mentions():
         """, con)
     return sig, ment
 
-# ---------------- Market stats ----------------
+# ---------------- Price stats ----------------
 def compute_metrics_from_history(df: pd.DataFrame) -> dict:
     out = {
         "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
@@ -190,8 +190,19 @@ def compute_metrics_from_history(df: pd.DataFrame) -> dict:
     out["ret_12m"] = ret(365)
     return out
 
-@st.cache_data(ttl=60*60, show_spinner=False)
-def yf_history(symbol: str, exchange: str, period_days: int = 370) -> pd.DataFrame:
+@st.cache_data(ttl=5*60, show_spinner=False)
+def yf_history_cached(symbol: str, exchange: str, period_days: int = 370) -> pd.DataFrame:
+    t = to_yahoo_ticker(symbol, exchange)
+    df = yf.download(t, period=f"{period_days}d", interval="1d", progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date","close","volume"])
+    df = df.reset_index()
+    df["date"] = pd.to_datetime(df["Date"]).dt.date.astype(str)
+    df = df.rename(columns={"Close":"close", "Volume":"volume"})
+    return df[["date","close","volume"]]
+
+def yf_history_force(symbol: str, exchange: str, period_days: int = 370) -> pd.DataFrame:
+    # no-cache fetch for “actual latest available”
     t = to_yahoo_ticker(symbol, exchange)
     df = yf.download(t, period=f"{period_days}d", interval="1d", progress=False)
     if df is None or df.empty:
@@ -202,65 +213,59 @@ def yf_history(symbol: str, exchange: str, period_days: int = 370) -> pd.DataFra
     return df[["date","close","volume"]]
 
 def refresh_one_stock(symbol: str, exchange: str, name: str):
-    """Immediate refresh: prices + news + signal (no GitHub Actions needed)."""
+    """Immediate refresh: prices + news + signal. Never crash on news API failures."""
     asof = date.today().isoformat()
 
-    # Prices
-    px = yf_history(symbol, exchange)
+    # Prices (force)
+    px = yf_history_force(symbol, exchange)
     upsert_prices(symbol, exchange, px)
 
-    # News
-    d5 = date.today() - dt.timedelta(days=5)
-    d30 = date.today() - dt.timedelta(days=30)
-    d60 = date.today() - dt.timedelta(days=60)
+    # News (safe)
+    try:
+        d5 = date.today() - dt.timedelta(days=5)
+        d30 = date.today() - dt.timedelta(days=30)
+        d60 = date.today() - dt.timedelta(days=60)
+        q = build_company_query(symbol, name)
 
-    q = build_company_query(symbol, name)
-    m5 = gdelt_mentions(q, d5, date.today())
-    m30 = gdelt_mentions(q, d30, date.today())
-    m60 = gdelt_mentions(q, d60, date.today())
-    headline, url = gdelt_latest_headline(q, d60, date.today())
-    upsert_news(symbol, exchange, asof, m60, headline, url)
+        m5 = gdelt_mentions(q, d5, date.today())
+        m30 = gdelt_mentions(q, d30, date.today())
+        m60 = gdelt_mentions(q, d60, date.today())
+        headline, url = gdelt_latest_headline(q, d60, date.today())
+        upsert_news(symbol, exchange, asof, m60, headline, url)
 
-    # Signal
-    score, reasons = compute_score(m5, m30, m60, px)
-    upsert_signal(symbol, exchange, asof, score, reasons)
+        score, reasons = compute_score(m5, m30, m60, px)
+        upsert_signal(symbol, exchange, asof, score, reasons)
+    except Exception:
+        # If GDELT fails, still compute score from prices (news=0)
+        score, reasons = compute_score(0, 0, 0, px)
+        upsert_signal(symbol, exchange, asof, score, reasons)
 
-def refresh_bulk(selected: pd.DataFrame, uni: pd.DataFrame):
-    """Refresh multiple stocks quickly (limited to avoid heavy load)."""
-    if selected.empty:
+def refresh_bulk(rows: pd.DataFrame, uni: pd.DataFrame, limit: int = 25):
+    if rows.empty:
         return
-    # safety: refresh max 25 at a time
-    sel = selected.head(25)
+    sel = rows.head(limit)
     for r in sel.itertuples(index=False):
         row = uni[(uni.symbol == r.symbol) & (uni.exchange == r.exchange)]
-        name = row.iloc[0]["name"] if not row.empty else r.symbol
-        try:
-            refresh_one_stock(r.symbol, r.exchange, name)
-        except Exception:
-            # keep going even if one fails
-            continue
+        nm = row.iloc[0]["name"] if not row.empty else r.symbol
+        refresh_one_stock(r.symbol, r.exchange, nm)
 
 # ---------------- PAGES ----------------
 if page == "Discover & Add":
-    st.subheader("🔎 Discover (checkbox add + live stats)")
+    st.subheader("Discover & Add")
 
     uni, _ = ensure_universe_loaded()
     uni = uni.copy()
     uni["sector"] = uni["sector"].fillna("Unknown")
 
-    # Top action bar (no scrolling to add button)
-    top = st.container()
-    with top:
-        c1, c2, c3, c4 = st.columns([3, 3, 2, 2])
-        with c1:
-            q = st.text_input("Search", placeholder="RELIANCE / TCS / VODAFONE / 500325")
-        with c2:
-            sectors_all = sorted([s for s in uni["sector"].unique() if isinstance(s, str)])
-            sectors = st.multiselect("Sector (multi)", options=sectors_all, default=[])
-        with c3:
-            st.metric("Universe", f"{len(uni):,}")
-        with c4:
-            st.write("")  # spacer
+    # Controls row
+    c1, c2, c3 = st.columns([3, 4, 2])
+    with c1:
+        q = st.text_input("Search", placeholder="RELIANCE / TCS / VODAFONE / 500325")
+    with c2:
+        sectors_all = sorted([s for s in uni["sector"].unique() if isinstance(s, str)])
+        sectors = st.multiselect("Sector (multi-select)", options=sectors_all, default=[])
+    with c3:
+        st.metric("Universe", f"{len(uni):,}")
 
     show = uni
     if sectors:
@@ -275,26 +280,28 @@ if page == "Discover & Add":
     show = show.head(250).copy()
     show.insert(0, "add", False)
 
-    # enrich top 40 for premium feel
+    # Top action buttons (no scrolling)
+    b1, b2, b3 = st.columns([2, 2, 4])
+    with b1:
+        add_selected_btn = st.button("➕ Add selected", use_container_width=True)
+    with b2:
+        add_all_btn = st.button("✅ Add ALL filtered (top 250)", use_container_width=True)
+    with b3:
+        st.caption("Tip: Use 'Add ALL filtered' for sector-wide selection. Refresh runs immediately (no Actions needed).")
+
+    # Enrich top 40 with live/returns (cached)
     enrich_rows = show.head(40).copy()
     metrics = []
     for r in enrich_rows.itertuples(index=False):
-        h = yf_history(r.symbol, r.exchange)
-        m = compute_metrics_from_history(h)
-        metrics.append(m)
+        h = yf_history_cached(r.symbol, r.exchange)
+        metrics.append(compute_metrics_from_history(h))
     met_df = pd.DataFrame(metrics)
     if not met_df.empty:
         enrich_rows = pd.concat([enrich_rows.reset_index(drop=True), met_df], axis=1)
-        show = show.merge(enrich_rows[["exchange","symbol","live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]],
-                          on=["exchange","symbol"], how="left")
-
-    # Add button ABOVE table
-    selected_placeholder = st.empty()
-    add_btn_col1, add_btn_col2 = st.columns([3, 2])
-    with add_btn_col1:
-        st.caption("Tick ✅ Add → then click the button (button stays here).")
-    with add_btn_col2:
-        add_now = st.button("➕ Add selected to Watchlist (and refresh)", use_container_width=True)
+        show = show.merge(
+            enrich_rows[["exchange","symbol","live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]],
+            on=["exchange","symbol"], how="left"
+        )
 
     edited = st.data_editor(
         show[[
@@ -320,24 +327,30 @@ if page == "Discover & Add":
     )
 
     selected = edited[edited["add"] == True][["symbol","exchange"]].drop_duplicates()
-    selected_placeholder.info(f"Selected: **{len(selected)}**")
+    st.info(f"Selected: **{len(selected)}**")
 
-    if add_now:
+    if add_all_btn:
+        add_to_watchlist_bulk(show[["symbol","exchange"]])
+        with st.spinner("Refreshing (prices/news/score) for added stocks…"):
+            refresh_bulk(show[["symbol","exchange"]], uni, limit=25)
+        st.success("Added ALL filtered (top 250). Refreshed first 25 now; remaining will update via scheduled Actions.")
+        st.rerun()
+
+    if add_selected_btn:
         add_to_watchlist_bulk(selected)
-        with st.spinner("Refreshing news + prices + score for selected stocks..."):
-            refresh_bulk(selected, uni)
-        st.success(f"Added & refreshed {min(len(selected),25)} stock(s). (If you selected more than 25, add next batch.)")
+        with st.spinner("Refreshing (prices/news/score) for selected stocks…"):
+            refresh_bulk(selected, uni, limit=25)
+        st.success("Added selected. Refreshed first 25 now; remaining will update via scheduled Actions.")
         st.rerun()
 
 elif page == "Watchlist":
-    st.subheader("📌 Watchlist (live stats + delete + story)")
+    st.subheader("Watchlist")
 
     wl = get_watchlist_df()
     if wl.empty:
         st.info("Watchlist empty. Add from Discover.")
         st.stop()
 
-    # filters
     sectors = sorted([s for s in wl["sector"].unique() if isinstance(s, str)])
     pick_sectors = st.multiselect("Filter by sector", options=sectors, default=[])
     view = wl.copy()
@@ -351,24 +364,24 @@ elif page == "Watchlist":
     df["score"] = df["score"].fillna(0).astype(int)
     df["mentions"] = df["mentions"].fillna(0).astype(int)
 
-    # live metrics (cached)
+    # compute metrics (cached)
     metrics = []
     for r in df.itertuples(index=False):
-        h = yf_history(r.symbol, r.exchange)
+        h = yf_history_cached(r.symbol, r.exchange)
         metrics.append(compute_metrics_from_history(h))
-    met_df = pd.DataFrame(metrics)
-    df = pd.concat([df.reset_index(drop=True), met_df], axis=1)
+    df = pd.concat([df.reset_index(drop=True), pd.DataFrame(metrics)], axis=1)
 
-    # sort by latest signal proxy
     df = df.sort_values(["score","mentions"], ascending=False).copy()
     df.insert(0, "delete", False)
 
-    # top actions
-    del_col1, del_col2 = st.columns([3, 2])
-    with del_col1:
-        st.caption("Tick Del ✅ and click delete (button stays here).")
-    with del_col2:
-        delete_now = st.button("🗑️ Delete selected", use_container_width=True)
+    # Top actions
+    a1, a2, a3 = st.columns([2, 2, 4])
+    with a1:
+        del_selected_btn = st.button("🗑️ Delete selected", use_container_width=True)
+    with a2:
+        del_all_btn = st.button("🧹 Delete ALL filtered", use_container_width=True)
+    with a3:
+        st.caption("Tip: Use 'Delete ALL filtered' to clear a whole sector filter at once.")
 
     edited = st.data_editor(
         df[[
@@ -396,50 +409,48 @@ elif page == "Watchlist":
     )
 
     to_del = edited[edited["delete"] == True][["symbol","exchange"]].drop_duplicates()
-    st.info(f"Selected for delete: **{len(to_del)}**")
 
-    if delete_now:
+    if del_all_btn:
+        remove_from_watchlist_bulk(view[["symbol","exchange"]])
+        st.success("Deleted ALL filtered watchlist items.")
+        st.rerun()
+
+    if del_selected_btn:
         remove_from_watchlist_bulk(to_del)
-        st.success(f"Deleted {len(to_del)} stock(s).")
+        st.success(f"Deleted {len(to_del)} selected item(s).")
         st.rerun()
 
     st.divider()
-    st.subheader("🧾 Story panel")
+    st.subheader("Stock story")
 
     options = edited.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist()
-    pick = st.selectbox("Select stock to view story", options)
-
+    pick = st.selectbox("Select stock", options)
     sel_sym = pick.split(" ")[0]
     sel_ex = pick.split("(")[1].split(")")[0]
 
     row = df[(df.symbol == sel_sym) & (df.exchange == sel_ex)].iloc[0]
     st.markdown(f"### **{row['name']}** — {sel_sym} ({sel_ex})")
 
-    # If missing headline/price in DB, refresh immediately
+    # Force refresh button (for "actual latest available")
+    if st.button("🔄 Refresh this stock now", use_container_width=True):
+        refresh_one_stock(sel_sym, sel_ex, row["name"])
+        st.success("Refreshed.")
+        st.rerun()
+
     headline = safe_str(row.get("sample_headline"))
     url = row.get("sample_url")
-
-    if not headline:
-        with st.spinner("Fetching latest story & updating…"):
-            refresh_one_stock(sel_sym, sel_ex, row["name"])
-        # reload latest
-        sig2, ment2 = get_latest_signals_mentions()
-        mrow = ment2[(ment2.symbol == sel_sym) & (ment2.exchange == sel_ex)]
-        if not mrow.empty:
-            headline = safe_str(mrow.iloc[0].get("sample_headline"))
-            url = mrow.iloc[0].get("sample_url")
 
     if headline:
         st.write("Latest headline sample:", headline)
     else:
-        st.info("No headline found yet (may be low coverage).")
+        st.info("No headline stored yet (coverage may be low).")
 
     if is_valid_url(url):
         st.link_button("Open article", url)
 
     px = get_prices_from_db(sel_sym, sel_ex)
     if px.empty:
-        px = yf_history(sel_sym, sel_ex)
+        px = yf_history_cached(sel_sym, sel_ex)
 
     if not px.empty and px["close"].notna().any():
         fig = go.Figure()
@@ -451,13 +462,13 @@ elif page == "Watchlist":
 
     if row.get("reasons"):
         try:
-            st.write("**Why this score?**")
+            st.write("Why this score?")
             st.json(json.loads(row["reasons"]))
         except Exception:
             pass
 
 else:
-    st.subheader("🧪 Paper Trading (demo coins)")
+    st.subheader("Paper Trading (demo)")
     with db() as con:
         cash = float(con.execute("SELECT cash FROM paper_wallet WHERE id=1").fetchone()[0])
         trades = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY ts DESC LIMIT 200", con)
