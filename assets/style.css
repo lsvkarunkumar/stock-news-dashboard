@@ -1,0 +1,5 @@
+/* Premium-ish spacing + cards */
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1250px; }
+[data-testid="stMetric"] { background: rgba(255,255,255,0.04); padding: 12px 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); }
+.stDataFrame { border-radius: 14px; overflow: hidden; border: 1px solid rgba(255,255,255,0.10); }
+div[data-testid="stExpander"] { border-radius: 14px; border: 1px solid rgba(255,255,255,0.10); }
