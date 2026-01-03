@@ -1,19 +1,23 @@
 import json
 import math
+import datetime as dt
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import date, datetime, timedelta
+from datetime import date
 
 from lib.db import init_db, db
 from lib.universe import get_universe, fetch_universe, upsert_universe
-from lib.prices import to_yahoo_ticker  # uses .NS / .BO
+from lib.prices import to_yahoo_ticker
+from lib.news import build_company_query, gdelt_mentions, gdelt_latest_headline
+from lib.scoring import compute_score
+
 import yfinance as yf
 
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
 
-# -------------------- UI / STYLE --------------------
+# ---------------- UI ----------------
 def load_css():
     try:
         with open("assets/style.css", "r", encoding="utf-8") as f:
@@ -25,15 +29,40 @@ init_db()
 load_css()
 
 st.title("🧠 News × Price Watchlist (Auto-updated)")
-st.caption("Educational dashboard. Final investment decision is always yours.")
+st.caption("Educational dashboard. Final decision is yours.")
 
 with st.sidebar:
     st.header("Controls")
     page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=0)
     st.divider()
-    st.caption("If you ran GitHub Actions and data doesn’t appear, use Streamlit → Reboot app.")
+    st.caption("GitHub Actions still refreshes in background every 6 hours. App also refreshes instantly when you add/view stocks.")
 
-# -------------------- DB HELPERS --------------------
+# ---------------- Helpers ----------------
+def is_valid_url(x):
+    if x is None:
+        return False
+    if isinstance(x, float) and math.isnan(x):
+        return False
+    if not isinstance(x, str):
+        return False
+    x = x.strip()
+    return x.startswith("http://") or x.startswith("https://")
+
+def safe_str(x):
+    if x is None:
+        return ""
+    if isinstance(x, float) and math.isnan(x):
+        return ""
+    return str(x)
+
+def ensure_universe_loaded():
+    uni = get_universe()
+    if len(uni) > 0:
+        return uni, False
+    fresh = fetch_universe()
+    upsert_universe(fresh)
+    return get_universe(), True
+
 def add_to_watchlist_bulk(rows: pd.DataFrame):
     if rows.empty:
         return
@@ -57,28 +86,10 @@ def remove_from_watchlist_bulk(rows: pd.DataFrame):
 def get_watchlist_df():
     with db() as con:
         return pd.read_sql_query("""
-            SELECT w.symbol, w.exchange, u.name, u.sector, w.added_at
+            SELECT w.symbol, w.exchange, u.name, COALESCE(u.sector,'Unknown') AS sector, w.added_at
             FROM watchlist w
             LEFT JOIN universe u ON u.symbol=w.symbol AND u.exchange=w.exchange
             ORDER BY w.added_at DESC
-        """, con)
-
-def get_latest_signals():
-    with db() as con:
-        return pd.read_sql_query("""
-            SELECT s.symbol, s.exchange, s.asof, s.score, s.reasons, u.name
-            FROM signals s
-            LEFT JOIN universe u ON u.symbol=s.symbol AND u.exchange=s.exchange
-            WHERE s.asof = (SELECT MAX(asof) FROM signals)
-        """, con)
-
-def get_latest_mentions():
-    with db() as con:
-        return pd.read_sql_query("""
-            SELECT n.symbol, n.exchange, n.date, n.mentions, n.sample_headline, n.sample_url, u.name
-            FROM news_mentions n
-            LEFT JOIN universe u ON u.symbol=n.symbol AND u.exchange=n.exchange
-            WHERE n.date = (SELECT MAX(date) FROM news_mentions)
         """, con)
 
 def get_prices_from_db(symbol, exchange):
@@ -90,86 +101,83 @@ def get_prices_from_db(symbol, exchange):
             ORDER BY date
         """, con, params=(symbol, exchange))
 
-def ensure_universe_loaded():
-    uni = get_universe()
-    if len(uni) > 0:
-        return uni, False
+def upsert_prices(symbol: str, exchange: str, df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    rows = [(symbol, exchange, r.date,
+             float(r.close) if pd.notna(r.close) else None,
+             float(r.volume) if pd.notna(r.volume) else None)
+            for r in df.itertuples(index=False)]
+    with db() as con:
+        con.executemany("""
+            INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume)
+            VALUES (?,?,?,?,?)
+        """, rows)
+        con.commit()
 
-    # fallback live load (so Discover works even if DB hasn't synced)
-    fresh = fetch_universe()
-    upsert_universe(fresh)
-    uni2 = get_universe()
-    return uni2, True
+def upsert_news(symbol: str, exchange: str, asof: str, mentions: int, headline, url):
+    with db() as con:
+        con.execute("""
+            INSERT INTO news_mentions(symbol, exchange, date, mentions, sample_headline, sample_url)
+            VALUES (?,?,?,?,?,?)
+        """, (symbol, exchange, asof, int(mentions), headline, url))
+        con.commit()
 
-# -------------------- DATA QUALITY HELPERS --------------------
-def is_valid_url(x):
-    if x is None:
-        return False
-    if isinstance(x, float) and math.isnan(x):
-        return False
-    if not isinstance(x, str):
-        return False
-    x = x.strip()
-    return x.startswith("http://") or x.startswith("https://")
+def upsert_signal(symbol: str, exchange: str, asof: str, score: int, reasons: str):
+    with db() as con:
+        con.execute("""
+            INSERT OR REPLACE INTO signals(symbol, exchange, asof, score, reasons)
+            VALUES (?,?,?,?,?)
+        """, (symbol, exchange, asof, score, reasons))
+        con.commit()
 
-def safe_str(x):
-    if x is None:
-        return ""
-    if isinstance(x, float) and math.isnan(x):
-        return ""
-    return str(x)
+def get_latest_signals_mentions():
+    with db() as con:
+        sig = pd.read_sql_query("""
+            SELECT s.symbol, s.exchange, s.asof, s.score, s.reasons
+            FROM signals s
+            WHERE s.asof = (SELECT MAX(asof) FROM signals)
+        """, con)
+        ment = pd.read_sql_query("""
+            SELECT n.symbol, n.exchange, n.date, n.mentions, n.sample_headline, n.sample_url
+            FROM news_mentions n
+            WHERE n.date = (SELECT MAX(date) FROM news_mentions)
+        """, con)
+    return sig, ment
 
-# -------------------- PRICE METRICS --------------------
-def _nearest_date_index(dates: pd.Series, target: pd.Timestamp):
-    # return index of last date <= target
-    d = pd.to_datetime(dates)
-    mask = d <= target
-    if not mask.any():
-        return None
-    return int(np.where(mask)[0][-1])
-
+# ---------------- Market stats ----------------
 def compute_metrics_from_history(df: pd.DataFrame) -> dict:
-    """
-    df columns: date(str), close(float), volume(float)
-    returns: live, 52w high/low, returns 1D/1W/1M/3M/6M/12M
-    """
     out = {
-        "live": np.nan,
-        "52w_high": np.nan,
-        "52w_low": np.nan,
-        "ret_1d": np.nan,
-        "ret_1w": np.nan,
-        "ret_1m": np.nan,
-        "ret_3m": np.nan,
-        "ret_6m": np.nan,
-        "ret_12m": np.nan,
+        "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
+        "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
+        "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
     }
     if df is None or df.empty or df["close"].isna().all():
         return out
 
-    df2 = df.copy()
-    df2["date"] = pd.to_datetime(df2["date"])
-    df2 = df2.dropna(subset=["close"]).sort_values("date")
-    if df2.empty:
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.dropna(subset=["close"]).sort_values("date")
+    if d.empty:
         return out
 
-    last_close = float(df2["close"].iloc[-1])
+    last_close = float(d["close"].iloc[-1])
     out["live"] = last_close
 
-    # 52 week (approx 365 days)
-    cutoff = df2["date"].iloc[-1] - pd.Timedelta(days=365)
-    df_52 = df2[df2["date"] >= cutoff]
-    if not df_52.empty:
-        out["52w_high"] = float(df_52["close"].max())
-        out["52w_low"] = float(df_52["close"].min())
+    cutoff = d["date"].iloc[-1] - pd.Timedelta(days=365)
+    d52 = d[d["date"] >= cutoff]
+    if not d52.empty:
+        out["52w_high"] = float(d52["close"].max())
+        out["52w_low"] = float(d52["close"].min())
 
-    # returns: use closest prior trading day to target
-    last_date = df2["date"].iloc[-1]
+    last_date = d["date"].iloc[-1]
+
     def ret(days):
-        idx = _nearest_date_index(df2["date"], last_date - pd.Timedelta(days=days))
-        if idx is None:
+        target = last_date - pd.Timedelta(days=days)
+        base_rows = d[d["date"] <= target]
+        if base_rows.empty:
             return np.nan
-        base = float(df2["close"].iloc[idx])
+        base = float(base_rows["close"].iloc[-1])
         if base == 0:
             return np.nan
         return (last_close / base - 1.0) * 100.0
@@ -182,103 +190,79 @@ def compute_metrics_from_history(df: pd.DataFrame) -> dict:
     out["ret_12m"] = ret(365)
     return out
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def fetch_history_yf(symbols_exchanges: list[tuple[str, str]], period_days: int = 370) -> dict:
-    """
-    Returns dict {(symbol, exchange): df(date, close, volume)}
-    Uses yfinance batch download for speed.
-    """
-    tickers = [to_yahoo_ticker(s, ex) for s, ex in symbols_exchanges]
-    # Batch download
-    data = yf.download(
-        tickers=tickers,
-        period=f"{period_days}d",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True,
-        progress=False,
-    )
+@st.cache_data(ttl=60*60, show_spinner=False)
+def yf_history(symbol: str, exchange: str, period_days: int = 370) -> pd.DataFrame:
+    t = to_yahoo_ticker(symbol, exchange)
+    df = yf.download(t, period=f"{period_days}d", interval="1d", progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date","close","volume"])
+    df = df.reset_index()
+    df["date"] = pd.to_datetime(df["Date"]).dt.date.astype(str)
+    df = df.rename(columns={"Close":"close", "Volume":"volume"})
+    return df[["date","close","volume"]]
 
-    out = {}
-    # Single ticker returns columns like ('Close') etc. Multi returns MultiIndex.
-    if isinstance(data.columns, pd.MultiIndex):
-        for (sym, ex), t in zip(symbols_exchanges, tickers):
-            try:
-                sub = data[t].dropna(how="all")
-                if sub.empty:
-                    out[(sym, ex)] = pd.DataFrame(columns=["date", "close", "volume"])
-                    continue
-                sub = sub.reset_index()
-                sub["date"] = pd.to_datetime(sub["Date"]).dt.date.astype(str)
-                out[(sym, ex)] = pd.DataFrame({
-                    "date": sub["date"],
-                    "close": sub.get("Close"),
-                    "volume": sub.get("Volume")
-                })
-            except Exception:
-                out[(sym, ex)] = pd.DataFrame(columns=["date", "close", "volume"])
-    else:
-        # single ticker
-        (sym, ex) = symbols_exchanges[0]
-        sub = data.dropna(how="all")
-        if sub.empty:
-            out[(sym, ex)] = pd.DataFrame(columns=["date", "close", "volume"])
-        else:
-            sub = sub.reset_index()
-            sub["date"] = pd.to_datetime(sub["Date"]).dt.date.astype(str)
-            out[(sym, ex)] = pd.DataFrame({
-                "date": sub["date"],
-                "close": sub.get("Close"),
-                "volume": sub.get("Volume")
-            })
-    return out
+def refresh_one_stock(symbol: str, exchange: str, name: str):
+    """Immediate refresh: prices + news + signal (no GitHub Actions needed)."""
+    asof = date.today().isoformat()
 
-def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 40) -> pd.DataFrame:
-    """
-    Adds live, 52w high/low, returns columns by fetching yfinance history for top N rows (performance safe).
-    """
-    if df.empty:
-        return df
+    # Prices
+    px = yf_history(symbol, exchange)
+    upsert_prices(symbol, exchange, px)
 
-    take = df.head(max_rows).copy()
-    pairs = [(r.symbol, r.exchange) for r in take.itertuples(index=False)]
-    histories = fetch_history_yf(pairs)
+    # News
+    d5 = date.today() - dt.timedelta(days=5)
+    d30 = date.today() - dt.timedelta(days=30)
+    d60 = date.today() - dt.timedelta(days=60)
 
-    metrics_rows = []
-    for r in take.itertuples(index=False):
-        hist = histories.get((r.symbol, r.exchange), pd.DataFrame())
-        m = compute_metrics_from_history(hist)
-        metrics_rows.append(m)
+    q = build_company_query(symbol, name)
+    m5 = gdelt_mentions(q, d5, date.today())
+    m30 = gdelt_mentions(q, d30, date.today())
+    m60 = gdelt_mentions(q, d60, date.today())
+    headline, url = gdelt_latest_headline(q, d60, date.today())
+    upsert_news(symbol, exchange, asof, m60, headline, url)
 
-    met = pd.DataFrame(metrics_rows)
-    out = pd.concat([take.reset_index(drop=True), met], axis=1)
+    # Signal
+    score, reasons = compute_score(m5, m30, m60, px)
+    upsert_signal(symbol, exchange, asof, score, reasons)
 
-    # format returns
-    return out
+def refresh_bulk(selected: pd.DataFrame, uni: pd.DataFrame):
+    """Refresh multiple stocks quickly (limited to avoid heavy load)."""
+    if selected.empty:
+        return
+    # safety: refresh max 25 at a time
+    sel = selected.head(25)
+    for r in sel.itertuples(index=False):
+        row = uni[(uni.symbol == r.symbol) & (uni.exchange == r.exchange)]
+        name = row.iloc[0]["name"] if not row.empty else r.symbol
+        try:
+            refresh_one_stock(r.symbol, r.exchange, name)
+        except Exception:
+            # keep going even if one fails
+            continue
 
-# -------------------- PAGES --------------------
+# ---------------- PAGES ----------------
 if page == "Discover & Add":
-    st.subheader("🔎 Discover stocks (NSE + BSE) and add with checkboxes")
+    st.subheader("🔎 Discover (checkbox add + live stats)")
 
-    uni, did_refresh = ensure_universe_loaded()
-    if did_refresh:
-        st.success("Universe was empty in this runtime — reloaded NSE+BSE universe now.")
+    uni, _ = ensure_universe_loaded()
+    uni = uni.copy()
+    uni["sector"] = uni["sector"].fillna("Unknown")
 
-    # Sector filter (works when sector is populated; otherwise show Unknown)
-    uni2 = uni.copy()
-    uni2["sector"] = uni2["sector"].fillna("Unknown")
-    all_sectors = sorted([s for s in uni2["sector"].unique() if isinstance(s, str)])
+    # Top action bar (no scrolling to add button)
+    top = st.container()
+    with top:
+        c1, c2, c3, c4 = st.columns([3, 3, 2, 2])
+        with c1:
+            q = st.text_input("Search", placeholder="RELIANCE / TCS / VODAFONE / 500325")
+        with c2:
+            sectors_all = sorted([s for s in uni["sector"].unique() if isinstance(s, str)])
+            sectors = st.multiselect("Sector (multi)", options=sectors_all, default=[])
+        with c3:
+            st.metric("Universe", f"{len(uni):,}")
+        with c4:
+            st.write("")  # spacer
 
-    c1, c2, c3 = st.columns([2, 3, 2])
-    with c1:
-        q = st.text_input("Search (name or symbol)", placeholder="e.g., RELIANCE / TCS / VODAFONE / 500325")
-    with c2:
-        sectors = st.multiselect("Sector filter (multi-select)", options=all_sectors, default=[])
-    with c3:
-        st.info(f"Universe: **{len(uni2):,}**", icon="📦")
-
-    show = uni2
+    show = uni
     if sectors:
         show = show[show["sector"].isin(sectors)]
     if q:
@@ -288,20 +272,29 @@ if page == "Discover & Add":
         )
         show = show[mask]
 
-    # Keep responsive
-    show = show.head(400).copy()
-
-    # Add checkbox column
+    show = show.head(250).copy()
     show.insert(0, "add", False)
 
-    # Enrich top rows with price metrics (live/52w/returns) for premium feel
-    enriched = enrich_with_metrics(show.drop(columns=["add"]).rename(columns={"symbol":"symbol","exchange":"exchange"}), max_rows=40)
-    # Merge back (only for top 40)
-    if not enriched.empty:
-        enriched_key = enriched[["exchange","symbol","live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]]
-        show = show.merge(enriched_key, on=["exchange","symbol"], how="left")
+    # enrich top 40 for premium feel
+    enrich_rows = show.head(40).copy()
+    metrics = []
+    for r in enrich_rows.itertuples(index=False):
+        h = yf_history(r.symbol, r.exchange)
+        m = compute_metrics_from_history(h)
+        metrics.append(m)
+    met_df = pd.DataFrame(metrics)
+    if not met_df.empty:
+        enrich_rows = pd.concat([enrich_rows.reset_index(drop=True), met_df], axis=1)
+        show = show.merge(enrich_rows[["exchange","symbol","live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]],
+                          on=["exchange","symbol"], how="left")
 
-    st.caption("Tip: Tick ✅ Add and click **Add selected to Watchlist**. (Price stats are fetched for top rows only for speed.)")
+    # Add button ABOVE table
+    selected_placeholder = st.empty()
+    add_btn_col1, add_btn_col2 = st.columns([3, 2])
+    with add_btn_col1:
+        st.caption("Tick ✅ Add → then click the button (button stays here).")
+    with add_btn_col2:
+        add_now = st.button("➕ Add selected to Watchlist (and refresh)", use_container_width=True)
 
     edited = st.data_editor(
         show[[
@@ -313,7 +306,7 @@ if page == "Discover & Add":
         height=560,
         hide_index=True,
         column_config={
-            "add": st.column_config.CheckboxColumn("Add", help="Tick to add to watchlist"),
+            "add": st.column_config.CheckboxColumn("Add"),
             "live": st.column_config.NumberColumn("Live", format="%.2f"),
             "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
             "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
@@ -326,64 +319,59 @@ if page == "Discover & Add":
         }
     )
 
-    selected = edited[edited["add"] == True][["symbol", "exchange"]].drop_duplicates()
+    selected = edited[edited["add"] == True][["symbol","exchange"]].drop_duplicates()
+    selected_placeholder.info(f"Selected: **{len(selected)}**")
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.write(f"Selected: **{len(selected)}**")
-    with col2:
-        if st.button("➕ Add selected to Watchlist", use_container_width=True):
-            add_to_watchlist_bulk(selected)
-            st.success(f"Added {len(selected)} stock(s) to watchlist.")
-            st.rerun()
-
-    st.divider()
-    st.write("✅ Next step: Run GitHub Actions → **Update Data** to fetch news + prices + scores for your watchlist.")
+    if add_now:
+        add_to_watchlist_bulk(selected)
+        with st.spinner("Refreshing news + prices + score for selected stocks..."):
+            refresh_bulk(selected, uni)
+        st.success(f"Added & refreshed {min(len(selected),25)} stock(s). (If you selected more than 25, add next batch.)")
+        st.rerun()
 
 elif page == "Watchlist":
-    st.subheader("📌 Your Watchlist (premium view + delete + story)")
+    st.subheader("📌 Watchlist (live stats + delete + story)")
 
     wl = get_watchlist_df()
     if wl.empty:
-        st.info("Watchlist is empty. Go to **Discover & Add**, tick stocks, and add them.")
+        st.info("Watchlist empty. Add from Discover.")
         st.stop()
 
-    sig = get_latest_signals()
-    ment = get_latest_mentions()
+    # filters
+    sectors = sorted([s for s in wl["sector"].unique() if isinstance(s, str)])
+    pick_sectors = st.multiselect("Filter by sector", options=sectors, default=[])
+    view = wl.copy()
+    if pick_sectors:
+        view = view[view["sector"].isin(pick_sectors)].copy()
 
-    df = wl.merge(sig[["symbol","exchange","score","reasons"]], on=["symbol","exchange"], how="left") \
-           .merge(ment[["symbol","exchange","mentions","sample_headline","sample_url"]], on=["symbol","exchange"], how="left")
+    sig, ment = get_latest_signals_mentions()
+    df = view.merge(sig[["symbol","exchange","score","reasons"]], on=["symbol","exchange"], how="left") \
+             .merge(ment[["symbol","exchange","mentions","sample_headline","sample_url"]], on=["symbol","exchange"], how="left")
 
     df["score"] = df["score"].fillna(0).astype(int)
     df["mentions"] = df["mentions"].fillna(0).astype(int)
-    df["sector"] = df["sector"].fillna("Unknown")
 
-    # Sector filter in watchlist
-    sectors = sorted([s for s in df["sector"].unique() if isinstance(s, str)])
-    pick_sectors = st.multiselect("Filter watchlist by sector", options=sectors, default=[])
-    if pick_sectors:
-        df = df[df["sector"].isin(pick_sectors)].copy()
+    # live metrics (cached)
+    metrics = []
+    for r in df.itertuples(index=False):
+        h = yf_history(r.symbol, r.exchange)
+        metrics.append(compute_metrics_from_history(h))
+    met_df = pd.DataFrame(metrics)
+    df = pd.concat([df.reset_index(drop=True), met_df], axis=1)
 
-    # Price metrics for top watchlist rows (fast, cached)
-    df_show = df.copy()
-    df_show.insert(0, "delete", False)
+    # sort by latest signal proxy
+    df = df.sort_values(["score","mentions"], ascending=False).copy()
+    df.insert(0, "delete", False)
 
-    enriched = enrich_with_metrics(df_show.drop(columns=["delete"]).rename(columns={"symbol":"symbol","exchange":"exchange"}), max_rows=min(60, len(df_show)))
-    if not enriched.empty:
-        enriched_key = enriched[["exchange","symbol","live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]]
-        df_show = df_show.merge(enriched_key, on=["exchange","symbol"], how="left")
-
-    # Sort by: score + mentions (proxy for “latest updates / news impact”)
-    df_show = df_show.sort_values(["score","mentions"], ascending=False)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Watchlist size", int(len(df_show)))
-    c2.metric("Top score", int(df_show["score"].max()) if len(df_show) else 0)
-    c3.metric("Total mentions (latest)", int(df_show["mentions"].sum()) if len(df_show) else 0)
-    c4.caption("Sorted by score + mention intensity (latest).")
+    # top actions
+    del_col1, del_col2 = st.columns([3, 2])
+    with del_col1:
+        st.caption("Tick Del ✅ and click delete (button stays here).")
+    with del_col2:
+        delete_now = st.button("🗑️ Delete selected", use_container_width=True)
 
     edited = st.data_editor(
-        df_show[[
+        df[[
             "delete","exchange","symbol","name","sector",
             "score","mentions",
             "live","52w_high","52w_low",
@@ -394,7 +382,7 @@ elif page == "Watchlist":
         height=520,
         hide_index=True,
         column_config={
-            "delete": st.column_config.CheckboxColumn("Del", help="Tick rows to delete from watchlist"),
+            "delete": st.column_config.CheckboxColumn("Del"),
             "live": st.column_config.NumberColumn("Live", format="%.2f"),
             "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
             "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
@@ -408,112 +396,70 @@ elif page == "Watchlist":
     )
 
     to_del = edited[edited["delete"] == True][["symbol","exchange"]].drop_duplicates()
-    if st.button("🗑️ Delete selected from Watchlist", use_container_width=True):
+    st.info(f"Selected for delete: **{len(to_del)}**")
+
+    if delete_now:
         remove_from_watchlist_bulk(to_del)
-        st.success(f"Deleted {len(to_del)} stock(s) from watchlist.")
+        st.success(f"Deleted {len(to_del)} stock(s).")
         st.rerun()
 
     st.divider()
     st.subheader("🧾 Story panel")
 
-    # Story dropdown
     options = edited.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist()
     pick = st.selectbox("Select stock to view story", options)
 
     sel_sym = pick.split(" ")[0]
     sel_ex = pick.split("(")[1].split(")")[0]
 
-    row = df_show[(df_show.symbol == sel_sym) & (df_show.exchange == sel_ex)].iloc[0]
-
+    row = df[(df.symbol == sel_sym) & (df.exchange == sel_ex)].iloc[0]
     st.markdown(f"### **{row['name']}** — {sel_sym} ({sel_ex})")
 
+    # If missing headline/price in DB, refresh immediately
     headline = safe_str(row.get("sample_headline"))
     url = row.get("sample_url")
+
+    if not headline:
+        with st.spinner("Fetching latest story & updating…"):
+            refresh_one_stock(sel_sym, sel_ex, row["name"])
+        # reload latest
+        sig2, ment2 = get_latest_signals_mentions()
+        mrow = ment2[(ment2.symbol == sel_sym) & (ment2.exchange == sel_ex)]
+        if not mrow.empty:
+            headline = safe_str(mrow.iloc[0].get("sample_headline"))
+            url = mrow.iloc[0].get("sample_url")
 
     if headline:
         st.write("Latest headline sample:", headline)
     else:
-        st.info("No headline stored yet. Run GitHub Actions again after you add this stock (watchlist).")
+        st.info("No headline found yet (may be low coverage).")
 
-    # ✅ BUG FIX: show link button only if URL is valid
     if is_valid_url(url):
         st.link_button("Open article", url)
 
-    # Price chart from DB if exists, else cached yfinance
     px = get_prices_from_db(sel_sym, sel_ex)
     if px.empty:
-        histories = fetch_history_yf([(sel_sym, sel_ex)])
-        px = histories.get((sel_sym, sel_ex), pd.DataFrame())
+        px = yf_history(sel_sym, sel_ex)
 
-    if px is not None and not px.empty and px["close"].notna().any():
+    if not px.empty and px["close"].notna().any():
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=px["date"], y=px["close"], mode="lines", name="Close"))
-        fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
+        fig.update_layout(height=360, margin=dict(l=10,r=10,t=30,b=10), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("No price data yet. Run GitHub Actions again (it fetches prices for watchlist stocks).")
+        st.warning("No price data available.")
 
-    # Explain score (if available)
     if row.get("reasons"):
         try:
-            reasons = json.loads(row["reasons"])
             st.write("**Why this score?**")
-            st.json(reasons)
+            st.json(json.loads(row["reasons"]))
         except Exception:
             pass
 
-elif page == "Paper Trading":
+else:
     st.subheader("🧪 Paper Trading (demo coins)")
-
     with db() as con:
         cash = float(con.execute("SELECT cash FROM paper_wallet WHERE id=1").fetchone()[0])
         trades = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY ts DESC LIMIT 200", con)
-
     st.metric("Demo cash", round(cash, 2))
-
-    wl = get_watchlist_df()
-    if wl.empty:
-        st.info("Add stocks to watchlist first.")
-        st.stop()
-
-    pick = st.selectbox("Trade symbol", wl.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist())
-    sel_sym = pick.split(" ")[0]
-    sel_ex = pick.split("(")[1].split(")")[0]
-
-    # prefer DB price, else yfinance
-    px = get_prices_from_db(sel_sym, sel_ex)
-    last_price = float(px["close"].dropna().iloc[-1]) if not px.empty and px["close"].notna().any() else np.nan
-    if np.isnan(last_price):
-        histories = fetch_history_yf([(sel_sym, sel_ex)])
-        px2 = histories.get((sel_sym, sel_ex), pd.DataFrame())
-        if px2 is not None and not px2.empty and px2["close"].notna().any():
-            last_price = float(px2["close"].dropna().iloc[-1])
-        else:
-            last_price = 0.0
-
-    c1, c2, c3 = st.columns(3)
-    side = c1.selectbox("Side", ["BUY", "SELL"])
-    qty = c2.number_input("Qty", min_value=1.0, value=1.0, step=1.0)
-    price = c3.number_input("Price", min_value=0.0, value=float(last_price), step=0.5)
-
-    notes = st.text_input("Notes (optional)", placeholder="e.g., Score>=90 auto rule / Manual conviction / News spike")
-
-    if st.button("✅ Place paper trade", use_container_width=True):
-        ts = pd.Timestamp.utcnow().isoformat()
-        cost = qty * price
-        with db() as con:
-            if side == "BUY" and cost > cash:
-                st.error("Not enough demo cash.")
-            else:
-                con.execute(
-                    "INSERT INTO paper_trades(ts,symbol,exchange,side,qty,price,notes) VALUES (?,?,?,?,?,?,?)",
-                    (ts, sel_sym, sel_ex, side, float(qty), float(price), notes)
-                )
-                new_cash = cash - cost if side == "BUY" else cash + cost
-                con.execute("UPDATE paper_wallet SET cash=? WHERE id=1", (new_cash,))
-                con.commit()
-                st.success(f"Paper trade placed: {side} {qty} @ {price}")
-                st.rerun()
-
-    st.write("Recent trades")
-    st.dataframe(trades, use_container_width=True, height=320)
+    st.dataframe(trades, use_container_width=True, height=420)
