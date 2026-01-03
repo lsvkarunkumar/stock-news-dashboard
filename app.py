@@ -18,6 +18,7 @@ from lib.scoring import indicator_features, indicator_score, combined_score
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
 
 
+# ---------------- Init ----------------
 def load_css():
     try:
         with open("assets/style.css", "r", encoding="utf-8") as f:
@@ -39,6 +40,7 @@ with st.sidebar:
     debug_on = st.toggle("Debug mode", value=False)
 
 
+# ---------------- Helpers ----------------
 def is_valid_url(x):
     if x is None:
         return False
@@ -66,6 +68,51 @@ def normalize_df(rows: pd.DataFrame) -> pd.DataFrame:
     return clean.drop_duplicates(subset=["symbol", "exchange"])
 
 
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance can return MultiIndex columns. This flattens them.
+    If columns are ('Close','RELIANCE.NS') -> 'Close'
+    If multiple tickers exist, keep first ticker.
+    """
+    if df is None or df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        # Choose first ticker slice (level 1), if present
+        try:
+            # common layout: level0 = OHLCV, level1 = ticker
+            tickers = list(dict.fromkeys([c[1] for c in df.columns if len(c) > 1]))
+            if tickers:
+                t0 = tickers[0]
+                df = df.xs(t0, axis=1, level=1, drop_level=True)
+        except Exception:
+            pass
+
+        # Flatten any remaining MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) and len(c) > 0 else str(c) for c in df.columns]
+
+    # Normalize column names
+    df = df.copy()
+    df.columns = [str(c) for c in df.columns]
+    return df
+
+
+def _series_col(df: pd.DataFrame, name_candidates):
+    """
+    Returns a 1-D Series for the first matching column.
+    Handles if df[col] returns a DataFrame (MultiIndex weirdness).
+    """
+    for nm in name_candidates:
+        if nm in df.columns:
+            col = df[nm]
+            if isinstance(col, pd.DataFrame):
+                # pick first column
+                return col.iloc[:, 0]
+            return col
+    return None
+
+
+# ---------------- DB ops ----------------
 def add_to_watchlist_bulk(rows: pd.DataFrame):
     if rows is None or rows.empty:
         return
@@ -138,37 +185,64 @@ def get_prices_from_db(symbol, exchange):
         )
 
 
+# ---------------- Market data (safe) ----------------
 def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
+    """
+    Always returns DataFrame with columns: date, close, volume
+    Works even when yfinance returns MultiIndex columns.
+    """
     t = to_yahoo_ticker(symbol, exchange)
+
+    # Intraday first
     try:
         raw = yf.download(t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False)
         if raw is not None and not raw.empty:
             df = raw.reset_index()
+            df = _flatten_yf_columns(df)
+
+            # datetime column
             dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
             df["date"] = pd.to_datetime(df[dt_col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-            close_col = "Close" if "Close" in df.columns else None
-            vol_col = "Volume" if "Volume" in df.columns else None
-            if close_col is None:
+
+            close_s = _series_col(df, ["Close", "close"])
+            vol_s = _series_col(df, ["Volume", "volume"])
+
+            if close_s is None:
                 return pd.DataFrame(columns=["date", "close", "volume"])
-            df["close"] = pd.to_numeric(df[close_col], errors="coerce")
-            df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
-            return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+
+            df["close"] = pd.to_numeric(close_s, errors="coerce")
+            df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
+
+            out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+            return out
     except Exception:
         pass
 
-    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
-    if raw is None or raw.empty:
+    # Daily fallback
+    try:
+        raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame(columns=["date", "close", "volume"])
+
+        df = raw.reset_index()
+        df = _flatten_yf_columns(df)
+
+        dcol = "Date" if "Date" in df.columns else df.columns[0]
+        df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
+
+        close_s = _series_col(df, ["Close", "close"])
+        vol_s = _series_col(df, ["Volume", "volume"])
+
+        if close_s is None:
+            return pd.DataFrame(columns=["date", "close", "volume"])
+
+        df["close"] = pd.to_numeric(close_s, errors="coerce")
+        df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
+
+        out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+        return out
+    except Exception:
         return pd.DataFrame(columns=["date", "close", "volume"])
-    df = raw.reset_index()
-    dcol = "Date" if "Date" in df.columns else df.columns[0]
-    df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
-    close_col = "Close" if "Close" in df.columns else None
-    vol_col = "Volume" if "Volume" in df.columns else None
-    if close_col is None:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-    df["close"] = pd.to_numeric(df[close_col], errors="coerce")
-    df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
-    return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
 
 
 @st.cache_data(ttl=5 * 60, show_spinner=False)
@@ -177,15 +251,20 @@ def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
     raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date", "close", "volume"])
+
     df = raw.reset_index()
+    df = _flatten_yf_columns(df)
+
     dcol = "Date" if "Date" in df.columns else df.columns[0]
     df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
-    close_col = "Close" if "Close" in df.columns else None
-    vol_col = "Volume" if "Volume" in df.columns else None
-    if close_col is None:
+
+    close_s = _series_col(df, ["Close", "close"])
+    vol_s = _series_col(df, ["Volume", "volume"])
+    if close_s is None:
         return pd.DataFrame(columns=["date", "close", "volume"])
-    df["close"] = pd.to_numeric(df[close_col], errors="coerce")
-    df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
+
+    df["close"] = pd.to_numeric(close_s, errors="coerce")
+    df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
     return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
 
 
@@ -215,6 +294,7 @@ def upsert_prices(symbol, exchange, df):
         con.commit()
 
 
+# ---------------- RSS news -> DB ----------------
 def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int = 60) -> int:
     items = fetch_google_news_rss(company_name, symbol, days=days)
     if not items:
@@ -288,6 +368,7 @@ def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.Data
         )
 
 
+# --------- Metrics ---------
 def compute_metrics(df: pd.DataFrame) -> dict:
     out = {
         "live": np.nan,
@@ -305,13 +386,13 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     if "close" not in df.columns:
         return out
 
-    close = df["close"]
+    close = pd.to_numeric(df["close"], errors="coerce")
     if close.dropna().empty:
         return out
 
     d = df.copy()
     d["date_dt"] = pd.to_datetime(d["date"], errors="coerce")
-    d["close_"] = pd.to_numeric(d["close"], errors="coerce")
+    d["close_"] = close
     d = d.dropna(subset=["date_dt", "close_"]).sort_values("date_dt")
     if d.empty:
         return out
@@ -356,25 +437,14 @@ def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
             h = yf_history_cached_daily(r.symbol, r.exchange)
             metrics.append(compute_metrics(h))
         except Exception:
-            metrics.append(
-                {
-                    "live": np.nan,
-                    "52w_high": np.nan,
-                    "52w_low": np.nan,
-                    "ret_1d": np.nan,
-                    "ret_1w": np.nan,
-                    "ret_1m": np.nan,
-                    "ret_3m": np.nan,
-                    "ret_6m": np.nan,
-                    "ret_12m": np.nan,
-                }
-            )
+            metrics.append({k: np.nan for k in ["live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]})
     met = pd.DataFrame(metrics)
     take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
     rest = df.iloc[max_rows:].copy()
     return pd.concat([take2, rest], axis=0, ignore_index=True)
 
 
+# ---------------- Refresh (Indicators + RSS) ----------------
 def refresh_one_stock(symbol: str, exchange: str, name: str):
     symbol = str(symbol).strip().upper()
     exchange = str(exchange).strip().upper()
@@ -398,7 +468,6 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
     m5, m60, recency_days = rss_counts(symbol, exchange)
     nscore = news_score_from_rss(m5, m60, recency_days)
 
-    # Indicator from DB prices (daily)
     dbpx = get_prices_from_db(symbol, exchange)
     feats = indicator_features(dbpx)
     iscore, ibreak = indicator_score(feats)
@@ -410,7 +479,6 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
         "indicator": ibreak,
         "combined": {"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind": 0.8, "w_news": 0.2},
     }
-    # Store combined score into signals.score
     upsert_signal(symbol, exchange, asof, cscore, reasons)
     return {"ok": True, "news_score": nscore, "indicator_score": iscore, "combined_score": cscore, "fetched": fetched}
 
@@ -622,7 +690,13 @@ elif page == "Watchlist":
         )
         st.rerun()
 
-    # Grouped RSS headlines
+    st.markdown("#### 🧠 Why this score?")
+    if row.get("reasons"):
+        try:
+            st.json(json.loads(row["reasons"]))
+        except Exception:
+            st.info("Score breakdown not available yet. Refresh once.")
+
     st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
     h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
     if h is None or h.empty:
@@ -637,10 +711,8 @@ elif page == "Watchlist":
             h["_t"] = h["title"].astype(str).str.strip().str.lower()
             h = h.drop_duplicates(subset=["published", "_t"]).drop(columns=["_t"])
             latest_date = h["published"].max()
-            unique_dates = sorted(h["published"].unique(), reverse=True)
-            for pub_date in unique_dates:
-                day_items = h[h["published"] == pub_date].copy()
-                day_items = day_items.sort_values(["source", "title"], ascending=[True, True])
+            for pub_date in sorted(h["published"].unique(), reverse=True):
+                day_items = h[h["published"] == pub_date].copy().sort_values(["source", "title"])
                 with st.expander(
                     f"📅 {pub_date} — {len(day_items)} headlines",
                     expanded=(pub_date == latest_date),
@@ -662,13 +734,6 @@ elif page == "Watchlist":
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.warning("No price data available from free source for this ticker.")
-
-    if row.get("reasons"):
-        try:
-            st.markdown("#### 🧠 Why this score?")
-            st.json(json.loads(row["reasons"]))
-        except Exception:
-            pass
 
 
 else:
