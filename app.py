@@ -18,7 +18,6 @@ from lib.scoring import indicator_features, indicator_score, combined_score
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
 
 
-# ---------------- Init ----------------
 def load_css():
     try:
         with open("assets/style.css", "r", encoding="utf-8") as f:
@@ -40,7 +39,6 @@ with st.sidebar:
     debug_on = st.toggle("Debug mode", value=False)
 
 
-# ---------------- Helpers ----------------
 def is_valid_url(x):
     if x is None:
         return False
@@ -69,47 +67,53 @@ def normalize_df(rows: pd.DataFrame) -> pd.DataFrame:
 
 
 def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    yfinance can return MultiIndex columns. This flattens them.
-    If columns are ('Close','RELIANCE.NS') -> 'Close'
-    If multiple tickers exist, keep first ticker.
-    """
     if df is None or df.empty:
         return df
     if isinstance(df.columns, pd.MultiIndex):
-        # Choose first ticker slice (level 1), if present
         try:
-            # common layout: level0 = OHLCV, level1 = ticker
             tickers = list(dict.fromkeys([c[1] for c in df.columns if len(c) > 1]))
             if tickers:
-                t0 = tickers[0]
-                df = df.xs(t0, axis=1, level=1, drop_level=True)
+                df = df.xs(tickers[0], axis=1, level=1, drop_level=True)
         except Exception:
             pass
-
-        # Flatten any remaining MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) and len(c) > 0 else str(c) for c in df.columns]
-
-    # Normalize column names
     df = df.copy()
     df.columns = [str(c) for c in df.columns]
     return df
 
 
 def _series_col(df: pd.DataFrame, name_candidates):
-    """
-    Returns a 1-D Series for the first matching column.
-    Handles if df[col] returns a DataFrame (MultiIndex weirdness).
-    """
     for nm in name_candidates:
         if nm in df.columns:
             col = df[nm]
             if isinstance(col, pd.DataFrame):
-                # pick first column
                 return col.iloc[:, 0]
             return col
     return None
+
+
+def _extract_scores_from_reasons(reasons_val):
+    """
+    reasons_val is JSON string or dict.
+    returns (indicator, news, combined)
+    """
+    ind = 0
+    news = 0
+    comb = 0
+    try:
+        if reasons_val is None or (isinstance(reasons_val, float) and math.isnan(reasons_val)):
+            return ind, news, comb
+        obj = reasons_val
+        if isinstance(reasons_val, str):
+            obj = json.loads(reasons_val)
+        scores = obj.get("scores", {})
+        ind = int(scores.get("indicator_score", 0) or 0)
+        news = int(scores.get("news_score", 0) or 0)
+        comb = int(scores.get("combined_score", 0) or 0)
+    except Exception:
+        pass
+    return ind, news, comb
 
 
 # ---------------- DB ops ----------------
@@ -167,11 +171,11 @@ def latest_signals_per_stock():
         )
 
 
-def upsert_signal(symbol, exchange, asof, score_val, reasons):
+def upsert_signal(symbol, exchange, asof, combined_val, reasons):
     with db() as con:
         con.execute(
             "INSERT OR REPLACE INTO signals(symbol, exchange, asof, score, reasons) VALUES (?,?,?,?,?)",
-            (symbol, exchange, asof, int(score_val), json.dumps(reasons)),
+            (symbol, exchange, asof, int(combined_val), json.dumps(reasons)),
         )
         con.commit()
 
@@ -187,10 +191,6 @@ def get_prices_from_db(symbol, exchange):
 
 # ---------------- Market data (safe) ----------------
 def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
-    """
-    Always returns DataFrame with columns: date, close, volume
-    Works even when yfinance returns MultiIndex columns.
-    """
     t = to_yahoo_ticker(symbol, exchange)
 
     # Intraday first
@@ -200,21 +200,17 @@ def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
             df = raw.reset_index()
             df = _flatten_yf_columns(df)
 
-            # datetime column
             dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
             df["date"] = pd.to_datetime(df[dt_col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
 
             close_s = _series_col(df, ["Close", "close"])
             vol_s = _series_col(df, ["Volume", "volume"])
-
             if close_s is None:
                 return pd.DataFrame(columns=["date", "close", "volume"])
 
             df["close"] = pd.to_numeric(close_s, errors="coerce")
             df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
-
-            out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-            return out
+            return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
     except Exception:
         pass
 
@@ -232,15 +228,12 @@ def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
 
         close_s = _series_col(df, ["Close", "close"])
         vol_s = _series_col(df, ["Volume", "volume"])
-
         if close_s is None:
             return pd.DataFrame(columns=["date", "close", "volume"])
 
         df["close"] = pd.to_numeric(close_s, errors="coerce")
         df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
-
-        out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-        return out
+        return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
     except Exception:
         return pd.DataFrame(columns=["date", "close", "volume"])
 
@@ -475,12 +468,18 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
 
     reasons = {
         "source": "Manual refresh",
-        "rss": {"fetched": fetched, "m5": m5, "m60": m60, "recency_days": recency_days, "news_score": nscore},
+        "scores": {
+            "indicator_score": iscore,
+            "news_score": nscore,
+            "combined_score": cscore,
+            "w_ind": 0.8,
+            "w_news": 0.2,
+        },
+        "rss": {"fetched": fetched, "m5": m5, "m60": m60, "recency_days": recency_days},
         "indicator": ibreak,
-        "combined": {"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind": 0.8, "w_news": 0.2},
     }
     upsert_signal(symbol, exchange, asof, cscore, reasons)
-    return {"ok": True, "news_score": nscore, "indicator_score": iscore, "combined_score": cscore, "fetched": fetched}
+    return {"ok": True, "indicator_score": iscore, "news_score": nscore, "combined_score": cscore}
 
 
 # ---------------- Debug panel ----------------
@@ -531,14 +530,25 @@ if page == "Discover & Add":
 
     sig = latest_signals_per_stock()
     if not sig.empty:
-        show = show.merge(sig[["symbol", "exchange", "score"]], on=["symbol", "exchange"], how="left")
+        show = show.merge(sig[["symbol", "exchange", "score", "reasons"]], on=["symbol", "exchange"], how="left")
     else:
         show["score"] = 0
-    show["score"] = show["score"].fillna(0).astype(int)
+        show["reasons"] = None
 
-    show = show.rename(columns={"score": "combined_score"})
+    # signals.score is CombinedScore
+    show["combined_score"] = show["score"].fillna(0).astype(int)
+
+    # parse reasons -> IndicatorScore, NewsScore
+    inds = []
+    news = []
+    for rv in show["reasons"].tolist():
+        i, n, c = _extract_scores_from_reasons(rv)
+        inds.append(i)
+        news.append(n)
+    show["indicator_score"] = inds
+    show["news_score"] = news
+
     show.insert(0, "add", False)
-
     show = enrich_with_metrics(show, max_rows=30)
 
     add_btn = st.button("➕ Add selected to Watchlist", use_container_width=True)
@@ -551,6 +561,8 @@ if page == "Discover & Add":
                 "symbol",
                 "name",
                 "sector",
+                "indicator_score",
+                "news_score",
                 "combined_score",
                 "live",
                 "52w_high",
@@ -568,7 +580,9 @@ if page == "Discover & Add":
         hide_index=True,
         column_config={
             "add": st.column_config.CheckboxColumn("Add"),
-            "combined_score": st.column_config.NumberColumn("CombinedScore", format="%d"),
+            "indicator_score": st.column_config.NumberColumn("Indicator", format="%d"),
+            "news_score": st.column_config.NumberColumn("News", format="%d"),
+            "combined_score": st.column_config.NumberColumn("Combined", format="%d"),
             "live": st.column_config.NumberColumn("Live", format="%.2f"),
             "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
             "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
@@ -613,8 +627,16 @@ elif page == "Watchlist":
         df["reasons"] = None
         df["asof"] = None
 
-    df["score"] = df["score"].fillna(0).astype(int)
-    df = df.rename(columns={"score": "combined_score"})
+    df["combined_score"] = df["score"].fillna(0).astype(int)
+
+    inds = []
+    news = []
+    for rv in df["reasons"].tolist():
+        i, n, c = _extract_scores_from_reasons(rv)
+        inds.append(i)
+        news.append(n)
+    df["indicator_score"] = inds
+    df["news_score"] = news
 
     df = enrich_with_metrics(df, max_rows=30)
     df = df.sort_values(["combined_score"], ascending=False).copy()
@@ -624,7 +646,7 @@ elif page == "Watchlist":
     with c1:
         del_btn = st.button("🗑️ Delete selected", use_container_width=True)
     with c2:
-        st.caption("Refresh from Story panel to update CombinedScore (Indicators+RSS).")
+        st.caption("Refresh from Story panel to update Indicator + News + Combined scores.")
 
     edited = st.data_editor(
         df[
@@ -634,6 +656,8 @@ elif page == "Watchlist":
                 "symbol",
                 "name",
                 "sector",
+                "indicator_score",
+                "news_score",
                 "combined_score",
                 "live",
                 "52w_high",
@@ -651,7 +675,9 @@ elif page == "Watchlist":
         hide_index=True,
         column_config={
             "delete": st.column_config.CheckboxColumn("Del"),
-            "combined_score": st.column_config.NumberColumn("CombinedScore", format="%d"),
+            "indicator_score": st.column_config.NumberColumn("Indicator", format="%d"),
+            "news_score": st.column_config.NumberColumn("News", format="%d"),
+            "combined_score": st.column_config.NumberColumn("Combined", format="%d"),
             "live": st.column_config.NumberColumn("Live", format="%.2f"),
             "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
             "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
@@ -681,16 +707,17 @@ elif page == "Watchlist":
 
     row = df[(df.symbol == sel_sym) & (df.exchange == sel_ex)].iloc[0]
     st.markdown(f"### **{row['name']}** — {sel_sym} ({sel_ex})")
-    st.caption("CombinedScore = 80% IndicatorScore + 20% NewsScore (RSS).")
+
+    st.caption("Combined = 0.8×Indicator + 0.2×News")
 
     if st.button("🔄 Refresh this stock now (Indicators + RSS + prices)", use_container_width=True):
         res = refresh_one_stock(sel_sym, sel_ex, row["name"])
         st.success(
-            f"Refreshed. Indicator={res.get('indicator_score')}  News={res.get('news_score')}  Combined={res.get('combined_score')}"
+            f"Refreshed: Indicator={res['indicator_score']}  News={res['news_score']}  Combined={res['combined_score']}"
         )
         st.rerun()
 
-    st.markdown("#### 🧠 Why this score?")
+    st.markdown("#### 🧠 Why these scores?")
     if row.get("reasons"):
         try:
             st.json(json.loads(row["reasons"]))
