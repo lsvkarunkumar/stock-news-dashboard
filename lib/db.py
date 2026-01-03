@@ -1,17 +1,32 @@
 import os
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
-DB_PATH = os.path.join("data", "app.db")
+DB_PATH = Path("data") / "app.db"
 
-def ensure_dirs():
-    os.makedirs("data", exist_ok=True)
+def _ensure_paths():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+@contextmanager
+def db():
+    """
+    Always opens the SAME sqlite file: data/app.db
+    Streamlit can write to repo workspace, so this should work.
+    """
+    _ensure_paths()
+    con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    try:
+        yield con
+    finally:
+        con.close()
 
 def init_db():
-    ensure_dirs()
-    with sqlite3.connect(DB_PATH) as con:
+    _ensure_paths()
+    with db() as con:
         cur = con.cursor()
 
+        # Universe
         cur.execute("""
         CREATE TABLE IF NOT EXISTS universe (
             symbol TEXT NOT NULL,
@@ -23,78 +38,77 @@ def init_db():
         )
         """)
 
+        # Watchlist
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS news_mentions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS watchlist (
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
-            date TEXT NOT NULL,       -- YYYY-MM-DD
-            mentions INTEGER NOT NULL,
-            sample_headline TEXT,
-            sample_url TEXT
+            added_at TEXT,
+            PRIMARY KEY(symbol, exchange)
         )
         """)
 
+        # Prices (daily/intraday)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS prices (
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
-            date TEXT NOT NULL,       -- YYYY-MM-DD
+            date TEXT NOT NULL,
             close REAL,
             volume REAL,
             PRIMARY KEY(symbol, exchange, date)
         )
         """)
 
+        # News mentions snapshots
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS news_mentions (
+            symbol TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            date TEXT NOT NULL,
+            mentions INTEGER,
+            sample_headline TEXT,
+            sample_url TEXT,
+            PRIMARY KEY(symbol, exchange, date)
+        )
+        """)
+
+        # Signals snapshots
         cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
-            asof TEXT NOT NULL,       -- YYYY-MM-DD
-            score INTEGER NOT NULL,
-            reasons TEXT NOT NULL,    -- JSON-ish string
+            asof TEXT NOT NULL,
+            score INTEGER,
+            reasons TEXT,
             PRIMARY KEY(symbol, exchange, asof)
         )
         """)
 
+        # Paper trading
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist (
-            symbol TEXT NOT NULL,
-            exchange TEXT NOT NULL,
-            added_at TEXT NOT NULL,
-            PRIMARY KEY(symbol, exchange)
+        CREATE TABLE IF NOT EXISTS paper_wallet (
+            id INTEGER PRIMARY KEY,
+            cash REAL
         )
         """)
+        cur.execute("INSERT OR IGNORE INTO paper_wallet(id, cash) VALUES (1, 1000000)")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS paper_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            exchange TEXT NOT NULL,
-            side TEXT NOT NULL,         -- BUY/SELL
-            qty REAL NOT NULL,
-            price REAL NOT NULL,
+            ts TEXT,
+            symbol TEXT,
+            exchange TEXT,
+            side TEXT,
+            qty REAL,
+            price REAL,
             notes TEXT
         )
         """)
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS paper_wallet (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            cash REAL NOT NULL
-        )
-        """)
-        cur.execute("INSERT OR IGNORE INTO paper_wallet (id, cash) VALUES (1, 1000000.0)")  # demo coins
+        # Helpful indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_prices_symex ON prices(symbol, exchange)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_symex ON news_mentions(symbol, exchange)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_symex ON signals(symbol, exchange)")
 
         con.commit()
-
-@contextmanager
-def db():
-    ensure_dirs()
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    try:
-        yield con
-    finally:
-        con.close()
