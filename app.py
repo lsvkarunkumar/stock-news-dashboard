@@ -596,30 +596,44 @@ elif page == "Watchlist":
         st.success(f"Refreshed. NewsScore={res.get('news_score')}  (fetched={res.get('fetched')})")
         st.rerun()
 
-    st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
+st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
 
-h = latest_rss_headlines(sel_sym, sel_ex, limit=60)  # pull more, then group
-if h.empty:
+h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
+
+if h is None or h.empty:
     st.info("No RSS headlines stored yet. Click refresh once.")
 else:
-    # Clean + sort
     h = h.copy()
+
+    # Normalize dates
     h["published"] = pd.to_datetime(h["published"], errors="coerce").dt.date
     h = h.dropna(subset=["published"])
-    h = h.sort_values(["published", "source"], ascending=[False, True])
 
-    # Optional: reduce duplicates that come via multiple aggregators (MSN etc.)
-    # Keep unique titles per date (case-insensitive)
-    h["_t"] = h["title"].astype(str).str.strip().str.lower()
-    h = h.drop_duplicates(subset=["published", "_t"]).drop(columns=["_t"])
+    if h.empty:
+        st.info("No valid-dated headlines available.")
+    else:
+        # Sort newest date first
+        h = h.sort_values("published", ascending=False)
 
-    # Group by date with expanders (clean UI)
-    for d, g in h.groupby("published", sort=False):
-        with st.expander(f"📅 {d}  — {len(g)} headlines", expanded=(d == h["published"].max())):
-            for _, r in g.iterrows():
-                st.write(f"• {r['title']}  ({r['source']})")
-                if is_valid_url(r["url"]):
-                    st.link_button("Open", r["url"])
+        # Remove duplicate titles (case-insensitive)
+        h["_t"] = h["title"].astype(str).str.strip().str.lower()
+        h = h.drop_duplicates(subset=["published", "_t"])
+        h = h.drop(columns=["_t"])
+
+        latest_date = h["published"].max()
+
+        for pub_date in sorted(h["published"].unique(), reverse=True):
+            day_items = h[h["published"] == pub_date]
+
+            with st.expander(
+                f"📅 {pub_date} — {len(day_items)} headlines",
+                expanded=(pub_date == latest_date)
+            ):
+                for _, r in day_items.iterrows():
+                    st.write(f"• {r['title']}  ({r['source']})")
+                    if is_valid_url(r["url"]):
+                        st.link_button("Open", r["url"])
+
 
     st.markdown("#### 📈 Price chart")
     px = get_prices_from_db(sel_sym, sel_ex)
