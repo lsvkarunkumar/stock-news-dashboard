@@ -1,0 +1,220 @@
+import json
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from datetime import date
+
+from lib.db import init_db, db
+from lib.universe import get_universe
+
+st.set_page_config(page_title="News × Price Dashboard", layout="wide")
+
+def load_css():
+    try:
+        with open("assets/style.css", "r", encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    except Exception:
+        pass
+
+init_db()
+load_css()
+
+st.title("🧠 News × Price Watchlist (Auto-updated)")
+st.caption("Educational dashboard. Final investment decision is always yours.")
+
+# Sidebar
+with st.sidebar:
+    st.header("Controls")
+    page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=1)
+    st.divider()
+
+# Helpers
+def add_to_watchlist(symbol: str, exchange: str):
+    with db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO watchlist(symbol, exchange, added_at) VALUES (?,?,?)",
+            (symbol, exchange, date.today().isoformat())
+        )
+        con.commit()
+
+def remove_from_watchlist(symbol: str, exchange: str):
+    with db() as con:
+        con.execute("DELETE FROM watchlist WHERE symbol=? AND exchange=?", (symbol, exchange))
+        con.commit()
+
+def get_watchlist_df():
+    with db() as con:
+        return pd.read_sql_query("""
+            SELECT w.symbol, w.exchange, u.name, w.added_at
+            FROM watchlist w
+            LEFT JOIN universe u ON u.symbol=w.symbol AND u.exchange=w.exchange
+            ORDER BY w.added_at DESC
+        """, con)
+
+def get_latest_signals():
+    with db() as con:
+        return pd.read_sql_query("""
+            SELECT s.symbol, s.exchange, s.asof, s.score, s.reasons, u.name
+            FROM signals s
+            LEFT JOIN universe u ON u.symbol=s.symbol AND u.exchange=s.exchange
+            WHERE s.asof = (SELECT MAX(asof) FROM signals)
+        """, con)
+
+def get_latest_mentions():
+    with db() as con:
+        return pd.read_sql_query("""
+            SELECT n.symbol, n.exchange, n.date, n.mentions, n.sample_headline, n.sample_url, u.name
+            FROM news_mentions n
+            LEFT JOIN universe u ON u.symbol=n.symbol AND u.exchange=n.exchange
+            WHERE n.date = (SELECT MAX(date) FROM news_mentions)
+        """, con)
+
+def get_prices(symbol, exchange):
+    with db() as con:
+        return pd.read_sql_query("""
+            SELECT date, close, volume
+            FROM prices
+            WHERE symbol=? AND exchange=?
+            ORDER BY date
+        """, con, params=(symbol, exchange))
+
+# Pages
+if page == "Discover & Add":
+    st.subheader("🔎 Discover stocks and add to watchlist")
+
+    uni = get_universe()
+    q = st.text_input("Search (name or symbol)", placeholder="e.g., VODAFONE / 532822 / TCS / RELIANCE")
+    if q:
+        m = uni["symbol"].str.contains(q, case=False, na=False) | uni["name"].str.contains(q, case=False, na=False)
+        show = uni[m].head(200)
+    else:
+        show = uni.sample(min(200, len(uni)), random_state=7) if len(uni) else uni
+
+    st.write("Tip: search → pick → add. (We keep it fast; showing 200 rows.)")
+    st.dataframe(show[["exchange","symbol","name","isin"]], use_container_width=True, height=420)
+
+    col1, col2 = st.columns([1,1])
+    with col1:
+        sym = st.text_input("Symbol", key="add_sym")
+    with col2:
+        ex = st.selectbox("Exchange", ["NSE","BSE"], key="add_ex")
+
+    if st.button("➕ Add to Watchlist", use_container_width=True):
+        if sym.strip():
+            add_to_watchlist(sym.strip(), ex)
+            st.success(f"Added: {sym.strip()} ({ex})")
+
+elif page == "Watchlist":
+    st.subheader("📌 Your Watchlist (ranked by news + signals)")
+
+    wl = get_watchlist_df()
+    sig = get_latest_signals()
+    ment = get_latest_mentions()
+
+    if wl.empty:
+        st.info("Your watchlist is empty. Go to **Discover & Add** and add a few stocks.")
+        st.stop()
+
+    df = wl.merge(sig[["symbol","exchange","score","reasons"]], on=["symbol","exchange"], how="left") \
+           .merge(ment[["symbol","exchange","mentions","sample_headline","sample_url"]], on=["symbol","exchange"], how="left")
+
+    # Simple ranking: score first, then mentions
+    df["score"] = df["score"].fillna(0).astype(int)
+    df["mentions"] = df["mentions"].fillna(0).astype(int)
+    df = df.sort_values(["score","mentions"], ascending=False)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Watchlist size", int(len(df)))
+    c2.metric("Top score", int(df["score"].max()))
+    c3.metric("Total mentions (latest)", int(df["mentions"].sum()))
+
+    st.dataframe(
+        df[["exchange","symbol","name","score","mentions","sample_headline"]],
+        use_container_width=True,
+        height=420
+    )
+
+    pick = st.selectbox("Select stock to view story", df.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist())
+    sel_sym = pick.split(" ")[0]
+    sel_ex = pick.split("(")[1].split(")")[0]
+
+    row = df[(df.symbol == sel_sym) & (df.exchange == sel_ex)].iloc[0]
+    st.markdown(f"### 🧾 Story: **{row['name']}** — {sel_sym} ({sel_ex})")
+
+    if row.get("sample_url"):
+        st.write("Latest headline sample:", row.get("sample_headline",""))
+        st.link_button("Open article", row["sample_url"])
+
+    px = get_prices(sel_sym, sel_ex)
+    if not px.empty and px["close"].notna().any():
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=px["date"], y=px["close"], mode="lines", name="Close"))
+        fig.update_layout(height=380, margin=dict(l=10,r=10,t=30,b=10), hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No price data yet (will appear after the next updater run).")
+
+    # Explain score
+    if row.get("reasons"):
+        try:
+            reasons = json.loads(row["reasons"])
+            st.write("**Why this score?**")
+            st.json(reasons)
+        except Exception:
+            pass
+
+    colA, colB = st.columns([1,1])
+    with colA:
+        if st.button("🗑️ Remove from watchlist", use_container_width=True):
+            remove_from_watchlist(sel_sym, sel_ex)
+            st.rerun()
+    with colB:
+        st.caption("Next data refresh runs automatically every ~6 hours via GitHub Actions.")
+
+elif page == "Paper Trading":
+    st.subheader("🧪 Paper Trading (demo coins)")
+
+    with db() as con:
+        cash = float(con.execute("SELECT cash FROM paper_wallet WHERE id=1").fetchone()[0])
+        trades = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY ts DESC LIMIT 200", con)
+
+    st.metric("Demo cash", round(cash, 2))
+
+    wl = get_watchlist_df()
+    if wl.empty:
+        st.info("Add stocks to watchlist first.")
+        st.stop()
+
+    pick = st.selectbox("Trade symbol", wl.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist())
+    sel_sym = pick.split(" ")[0]
+    sel_ex = pick.split("(")[1].split(")")[0]
+
+    px = get_prices(sel_sym, sel_ex)
+    last_price = float(px["close"].dropna().iloc[-1]) if not px.empty and px["close"].notna().any() else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    side = c1.selectbox("Side", ["BUY","SELL"])
+    qty = c2.number_input("Qty", min_value=1.0, value=1.0, step=1.0)
+    price = c3.number_input("Price", min_value=0.0, value=last_price, step=0.5)
+
+    notes = st.text_input("Notes (optional)", placeholder="e.g., Score>=90 auto rule / Manual conviction / News spike")
+
+    if st.button("✅ Place paper trade", use_container_width=True):
+        ts = pd.Timestamp.utcnow().isoformat()
+        cost = qty * price
+        with db() as con:
+            if side == "BUY" and cost > cash:
+                st.error("Not enough demo cash. (You can add refill later.)")
+            else:
+                con.execute(
+                    "INSERT INTO paper_trades(ts,symbol,exchange,side,qty,price,notes) VALUES (?,?,?,?,?,?,?)",
+                    (ts, sel_sym, sel_ex, side, float(qty), float(price), notes)
+                )
+                # Update cash
+                new_cash = cash - cost if side == "BUY" else cash + cost
+                con.execute("UPDATE paper_wallet SET cash=? WHERE id=1", (new_cash,))
+                con.commit()
+                st.success(f"Paper trade placed: {side} {qty} @ {price}")
+
+    st.write("Recent trades")
+    st.dataframe(trades, use_container_width=True, height=320)
