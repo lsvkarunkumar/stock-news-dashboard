@@ -163,8 +163,8 @@ def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int =
     return len(items)
 
 def rss_counts(symbol: str, exchange: str):
-    symbol = str(symbol).strip().upper()
-    exchange = str(exchange).strip().upper()
+    symbol = str(symbol).strip().str.upper()
+    exchange = str(exchange).strip().str.upper()
     today = dt.date.today()
 
     with db() as con:
@@ -227,7 +227,7 @@ def latest_rss_headlines(symbol: str, exchange: str, limit: int = 12) -> pd.Data
 def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
     t = to_yahoo_ticker(symbol, exchange)
 
-    # try intraday 1m
+    # Try intraday 1m
     try:
         df = yf.download(t, period="1d", interval="1m", progress=False, threads=True)
         if df is not None and not df.empty:
@@ -239,7 +239,7 @@ def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # fallback daily
+    # Fallback daily
     df = yf.download(t, period="370d", interval="1d", progress=False, threads=True)
     if df is None or df.empty:
         return pd.DataFrame(columns=["date", "close", "volume"])
@@ -259,29 +259,45 @@ def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
     df = df.rename(columns={"Close": "close", "Volume": "volume"})
     return df[["date", "close", "volume"]]
 
+# --------- CRASH FIXED HERE: robust metrics ---------
 def compute_metrics(df: pd.DataFrame) -> dict:
     out = {
         "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
         "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
         "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
     }
-    if df is None or df.empty or df["close"].isna().all():
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return out
+    if "close" not in df.columns:
+        return out
+
+    close_col = df["close"]
+    if isinstance(close_col, pd.DataFrame):
+        close = close_col.iloc[:, 0]  # take first if multi
+    else:
+        close = close_col
+
+    if not isinstance(close, pd.Series):
+        return out
+    if close.dropna().empty:
         return out
 
     d = df.copy()
     d["date_dt"] = pd.to_datetime(d["date"], errors="coerce")
-    d = d.dropna(subset=["date_dt", "close"]).sort_values("date_dt")
+    d["close_"] = pd.to_numeric(close, errors="coerce")
+    d = d.dropna(subset=["date_dt", "close_"]).sort_values("date_dt")
     if d.empty:
         return out
 
-    last_close = float(d["close"].iloc[-1])
+    last_close = float(d["close_"].iloc[-1])
     out["live"] = last_close
 
     cutoff = d["date_dt"].iloc[-1] - pd.Timedelta(days=365)
     d52 = d[d["date_dt"] >= cutoff]
     if not d52.empty:
-        out["52w_high"] = float(d52["close"].max())
-        out["52w_low"] = float(d52["close"].min())
+        out["52w_high"] = float(d52["close_"].max())
+        out["52w_low"] = float(d52["close_"].min())
 
     last_dt = d["date_dt"].iloc[-1]
 
@@ -290,7 +306,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         base_rows = d[d["date_dt"] <= target]
         if base_rows.empty:
             return np.nan
-        base = float(base_rows["close"].iloc[-1])
+        base = float(base_rows["close_"].iloc[-1])
         if base == 0:
             return np.nan
         return (last_close / base - 1.0) * 100.0
@@ -304,13 +320,25 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     return out
 
 def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
+    """
+    Adds live/52W/returns for top rows. Never crashes the app.
+    """
     if df is None or df.empty:
         return df
+
     take = df.head(max_rows).copy()
     metrics = []
     for r in take.itertuples(index=False):
-        h = yf_history_cached_daily(r.symbol, r.exchange)
-        metrics.append(compute_metrics(h))
+        try:
+            h = yf_history_cached_daily(r.symbol, r.exchange)
+            metrics.append(compute_metrics(h))
+        except Exception:
+            metrics.append({
+                "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
+                "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
+                "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
+            })
+
     met = pd.DataFrame(metrics)
     take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
     rest = df.iloc[max_rows:].copy()
@@ -349,7 +377,7 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
         "mentions_60d": m60,
         "recency_days": recency_days,
         "news_score": nscore,
-        "note": "Next step: add IndicatorScore (80%) + CombinedScore + Auto/Manual paper trading"
+        "note": "Next step: IndicatorScore (80%) + CombinedScore + Manual Confidence + Auto/Manual paper trading"
     }
     upsert_signal(symbol, exchange, asof, nscore, json.dumps(reasons))
     return {"ok": True, "news_score": nscore, "fetched": fetched}
@@ -372,6 +400,7 @@ if page == "Discover & Add":
 
     uni, _ = ensure_universe_loaded()
     uni = uni.copy()
+
     uni["sector"] = uni.get("sector", "Unknown")
     if "sector" in uni.columns:
         uni["sector"] = uni["sector"].fillna("Unknown")
@@ -402,22 +431,24 @@ if page == "Discover & Add":
 
     show = show.head(250).copy()
 
-    # bring in latest score
+    # Bring in latest score
     sig = latest_signals_per_stock()
-    show = show.merge(sig[["symbol","exchange","score"]], on=["symbol","exchange"], how="left")
+    show = show.merge(sig[["symbol", "exchange", "score"]], on=["symbol", "exchange"], how="left")
     show["score"] = show["score"].fillna(0).astype(int)
 
     show.insert(0, "add", False)
+
+    # Enrich (robust)
     show = enrich_with_metrics(show, max_rows=30)
 
     add_btn = st.button("➕ Add selected to Watchlist", use_container_width=True)
 
     edited = st.data_editor(
         show[[
-            "add","exchange","symbol","name","sector",
+            "add", "exchange", "symbol", "name", "sector",
             "score",
-            "live","52w_high","52w_low",
-            "ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"
+            "live", "52w_high", "52w_low",
+            "ret_1d", "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_12m"
         ]],
         use_container_width=True,
         height=560,
@@ -437,7 +468,7 @@ if page == "Discover & Add":
         }
     )
 
-    selected = edited[edited["add"] == True][["symbol","exchange"]].drop_duplicates()
+    selected = edited[edited["add"] == True][["symbol", "exchange"]].drop_duplicates()
     st.info(f"Selected: **{len(selected)}**")
 
     if add_btn:
@@ -460,7 +491,7 @@ elif page == "Watchlist":
         view = view[view["sector"].isin(pick_sectors)].copy()
 
     sig = latest_signals_per_stock()
-    df = view.merge(sig[["symbol","exchange","score","reasons","asof"]], on=["symbol","exchange"], how="left")
+    df = view.merge(sig[["symbol", "exchange", "score", "reasons", "asof"]], on=["symbol", "exchange"], how="left")
     df["score"] = df["score"].fillna(0).astype(int)
 
     df = enrich_with_metrics(df, max_rows=30)
@@ -475,10 +506,10 @@ elif page == "Watchlist":
 
     edited = st.data_editor(
         df[[
-            "delete","exchange","symbol","name","sector",
+            "delete", "exchange", "symbol", "name", "sector",
             "score",
-            "live","52w_high","52w_low",
-            "ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"
+            "live", "52w_high", "52w_low",
+            "ret_1d", "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_12m"
         ]],
         use_container_width=True,
         height=520,
@@ -498,7 +529,7 @@ elif page == "Watchlist":
         }
     )
 
-    to_del = edited[edited["delete"] == True][["symbol","exchange"]].drop_duplicates()
+    to_del = edited[edited["delete"] == True][["symbol", "exchange"]].drop_duplicates()
     if del_btn:
         remove_from_watchlist_bulk(to_del)
         st.success(f"Deleted {len(to_del)} item(s).")
