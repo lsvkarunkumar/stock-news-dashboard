@@ -13,11 +13,10 @@ def _gdelt_request(params: dict):
     )
     r.raise_for_status()
 
-    # Sometimes GDELT returns non-JSON (HTML error page, rate limit, etc.)
+    # GDELT sometimes returns HTML or non-JSON (rate limit / transient errors).
     try:
         return r.json()
     except Exception:
-        # best-effort fallback: try to parse text if it's JSON-looking
         txt = (r.text or "").strip()
         try:
             return json.loads(txt)
