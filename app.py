@@ -5,7 +5,7 @@ import streamlit as st
 from datetime import date
 
 from lib.db import init_db, db
-from lib.universe import get_universe
+from lib.universe import get_universe, fetch_universe, upsert_universe
 
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
 
@@ -25,15 +25,18 @@ st.caption("Educational dashboard. Final investment decision is always yours.")
 # Sidebar
 with st.sidebar:
     st.header("Controls")
-    page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=1)
+    page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=0)
     st.divider()
+    st.caption("Tip: If you just ran GitHub Actions, use Streamlit 'Reboot app' if data doesn't appear.")
 
 # Helpers
-def add_to_watchlist(symbol: str, exchange: str):
+def add_to_watchlist_bulk(rows: pd.DataFrame):
+    if rows.empty:
+        return
     with db() as con:
-        con.execute(
+        con.executemany(
             "INSERT OR IGNORE INTO watchlist(symbol, exchange, added_at) VALUES (?,?,?)",
-            (symbol, exchange, date.today().isoformat())
+            [(r.symbol, r.exchange, date.today().isoformat()) for r in rows.itertuples(index=False)]
         )
         con.commit()
 
@@ -78,47 +81,85 @@ def get_prices(symbol, exchange):
             ORDER BY date
         """, con, params=(symbol, exchange))
 
-# Pages
-if page == "Discover & Add":
-    st.subheader("🔎 Discover stocks and add to watchlist")
-
+def ensure_universe_loaded():
+    """If universe table is empty in this Streamlit runtime, load it once."""
     uni = get_universe()
-    q = st.text_input("Search (name or symbol)", placeholder="e.g., VODAFONE / 532822 / TCS / RELIANCE")
+    if len(uni) > 0:
+        return uni, False
+
+    # Fallback: fetch and populate (no keys needed)
+    try:
+        fresh = fetch_universe()
+        upsert_universe(fresh)
+        uni2 = get_universe()
+        return uni2, True
+    except Exception as e:
+        return uni, False
+
+# ---------------- PAGES ----------------
+
+if page == "Discover & Add":
+    st.subheader("🔎 Discover stocks (NSE + BSE) and add with checkboxes")
+
+    uni, did_refresh = ensure_universe_loaded()
+    if did_refresh:
+        st.success("Universe was empty in this runtime — reloaded NSE+BSE universe now.")
+
+    st.info(f"Universe loaded: **{len(uni):,}** rows")
+    if uni.empty:
+        st.error("Universe is still empty. This means Streamlit runtime didn't get the DB update AND live fetch failed.")
+        st.stop()
+
+    # Search
+    q = st.text_input("Search (name or symbol)", placeholder="e.g., RELIANCE / TCS / VODAFONE / 500325")
     if q:
-        m = uni["symbol"].str.contains(q, case=False, na=False) | uni["name"].str.contains(q, case=False, na=False)
-        show = uni[m].head(200)
+        mask = (
+            uni["symbol"].astype(str).str.contains(q, case=False, na=False) |
+            uni["name"].astype(str).str.contains(q, case=False, na=False)
+        )
+        show = uni[mask].head(500).copy()
     else:
-        show = uni.sample(min(200, len(uni)), random_state=7) if len(uni) else uni
+        show = uni.head(300).copy()  # fast preview
 
-    st.write("Tip: search → pick → add. (We keep it fast; showing 200 rows.)")
-    st.dataframe(show[["exchange","symbol","name","isin"]], use_container_width=True, height=420)
+    # Checkbox UI
+    show.insert(0, "add", False)
+    edited = st.data_editor(
+        show[["add", "exchange", "symbol", "name", "isin"]],
+        use_container_width=True,
+        height=520,
+        hide_index=True,
+        column_config={
+            "add": st.column_config.CheckboxColumn("Add", help="Tick to add to watchlist"),
+        }
+    )
 
-    col1, col2 = st.columns([1,1])
+    selected = edited[edited["add"] == True][["symbol", "exchange"]].drop_duplicates()
+
+    col1, col2 = st.columns([1, 1])
     with col1:
-        sym = st.text_input("Symbol", key="add_sym")
+        st.write(f"Selected: **{len(selected)}**")
     with col2:
-        ex = st.selectbox("Exchange", ["NSE","BSE"], key="add_ex")
+        if st.button("➕ Add selected to Watchlist", use_container_width=True):
+            add_to_watchlist_bulk(selected)
+            st.success(f"Added {len(selected)} stock(s) to watchlist.")
+            st.rerun()
 
-    if st.button("➕ Add to Watchlist", use_container_width=True):
-        if sym.strip():
-            add_to_watchlist(sym.strip(), ex)
-            st.success(f"Added: {sym.strip()} ({ex})")
+    st.caption("Note: Scores/News/Prices will appear after GitHub Actions 'Update Data' runs again (since it processes watchlist).")
 
 elif page == "Watchlist":
-    st.subheader("📌 Your Watchlist (ranked by news + signals)")
+    st.subheader("📌 Your Watchlist (ranked by signals)")
 
     wl = get_watchlist_df()
+    if wl.empty:
+        st.info("Watchlist is empty. Go to **Discover & Add**, tick stocks, and add them.")
+        st.stop()
+
     sig = get_latest_signals()
     ment = get_latest_mentions()
-
-    if wl.empty:
-        st.info("Your watchlist is empty. Go to **Discover & Add** and add a few stocks.")
-        st.stop()
 
     df = wl.merge(sig[["symbol","exchange","score","reasons"]], on=["symbol","exchange"], how="left") \
            .merge(ment[["symbol","exchange","mentions","sample_headline","sample_url"]], on=["symbol","exchange"], how="left")
 
-    # Simple ranking: score first, then mentions
     df["score"] = df["score"].fillna(0).astype(int)
     df["mentions"] = df["mentions"].fillna(0).astype(int)
     df = df.sort_values(["score","mentions"], ascending=False)
@@ -134,7 +175,10 @@ elif page == "Watchlist":
         height=420
     )
 
-    pick = st.selectbox("Select stock to view story", df.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist())
+    pick = st.selectbox(
+        "Select stock to view story",
+        df.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist()
+    )
     sel_sym = pick.split(" ")[0]
     sel_ex = pick.split("(")[1].split(")")[0]
 
@@ -144,6 +188,8 @@ elif page == "Watchlist":
     if row.get("sample_url"):
         st.write("Latest headline sample:", row.get("sample_headline",""))
         st.link_button("Open article", row["sample_url"])
+    else:
+        st.info("No headline stored yet. Run GitHub Actions again after adding stocks.")
 
     px = get_prices(sel_sym, sel_ex)
     if not px.empty and px["close"].notna().any():
@@ -152,9 +198,8 @@ elif page == "Watchlist":
         fig.update_layout(height=380, margin=dict(l=10,r=10,t=30,b=10), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("No price data yet (will appear after the next updater run).")
+        st.warning("No price data yet. Run GitHub Actions again (it fetches prices for watchlist stocks).")
 
-    # Explain score
     if row.get("reasons"):
         try:
             reasons = json.loads(row["reasons"])
@@ -163,13 +208,9 @@ elif page == "Watchlist":
         except Exception:
             pass
 
-    colA, colB = st.columns([1,1])
-    with colA:
-        if st.button("🗑️ Remove from watchlist", use_container_width=True):
-            remove_from_watchlist(sel_sym, sel_ex)
-            st.rerun()
-    with colB:
-        st.caption("Next data refresh runs automatically every ~6 hours via GitHub Actions.")
+    if st.button("🗑️ Remove from watchlist", use_container_width=True):
+        remove_from_watchlist(sel_sym, sel_ex)
+        st.rerun()
 
 elif page == "Paper Trading":
     st.subheader("🧪 Paper Trading (demo coins)")
@@ -204,13 +245,12 @@ elif page == "Paper Trading":
         cost = qty * price
         with db() as con:
             if side == "BUY" and cost > cash:
-                st.error("Not enough demo cash. (You can add refill later.)")
+                st.error("Not enough demo cash.")
             else:
                 con.execute(
                     "INSERT INTO paper_trades(ts,symbol,exchange,side,qty,price,notes) VALUES (?,?,?,?,?,?,?)",
                     (ts, sel_sym, sel_ex, side, float(qty), float(price), notes)
                 )
-                # Update cash
                 new_cash = cash - cost if side == "BUY" else cash + cost
                 con.execute("UPDATE paper_wallet SET cash=? WHERE id=1", (new_cash,))
                 con.commit()
