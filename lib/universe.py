@@ -3,6 +3,7 @@ import requests
 from io import StringIO
 from .db import db
 
+# Official sources (can change columns over time, so we handle flexibly)
 NSE_EQUITY_L = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 BSE_LIST = "https://www.bseindia.com/downloads1/List_of_companies.csv"
 
@@ -11,34 +12,61 @@ def _get(url: str) -> str:
     r.raise_for_status()
     return r.text
 
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower().replace("\ufeff", "") for c in df.columns]
+    return df
+
+def _pick(df: pd.DataFrame, candidates: list[str], default=None):
+    """Pick the first matching column from candidates (case-normalized)."""
+    for c in candidates:
+        c2 = c.strip().lower()
+        if c2 in df.columns:
+            return df[c2]
+    return default
+
 def fetch_universe() -> pd.DataFrame:
-    # NSE
-    nse = pd.read_csv(StringIO(_get(NSE_EQUITY_L)))
-    nse = nse.rename(columns={
-        "SYMBOL": "symbol",
-        "NAME OF COMPANY": "name",
-        "ISIN NUMBER": "isin"
-    })
-    nse["exchange"] = "NSE"
-    nse = nse[["symbol", "exchange", "name", "isin"]]
+    # -------- NSE --------
+    nse_raw = pd.read_csv(StringIO(_get(NSE_EQUITY_L)))
+    nse = _norm_cols(nse_raw)
 
-    # BSE
-    bse = pd.read_csv(StringIO(_get(BSE_LIST)))
-    # Common columns: "Scrip Code","Security Name","ISIN No"
-    bse = bse.rename(columns={
-        "Scrip Code": "symbol",
-        "Security Name": "name",
-        "ISIN No": "isin"
-    })
-    bse["symbol"] = bse["symbol"].astype(str)
-    bse["exchange"] = "BSE"
-    bse = bse[["symbol", "exchange", "name", "isin"]]
+    nse_symbol = _pick(nse, ["symbol", "sym", "security symbol"])
+    nse_name   = _pick(nse, ["name of company", "company name", "security name", "name"])
+    nse_isin   = _pick(nse, ["isin number", "isin", "isin no", "isin code"], default="")
 
-    uni = pd.concat([nse, bse], ignore_index=True).dropna(subset=["symbol", "exchange"])
+    nse_df = pd.DataFrame({
+        "symbol": nse_symbol.astype(str).str.strip() if nse_symbol is not None else pd.Series(dtype=str),
+        "exchange": "NSE",
+        "name": nse_name.astype(str).str.strip() if nse_name is not None else "",
+        "isin": nse_isin.astype(str).str.strip() if isinstance(nse_isin, pd.Series) else ""
+    })
+    nse_df = nse_df.dropna(subset=["symbol"])
+    nse_df = nse_df[nse_df["symbol"].astype(str).str.len() > 0]
+
+    # -------- BSE --------
+    bse_raw = pd.read_csv(StringIO(_get(BSE_LIST)))
+    bse = _norm_cols(bse_raw)
+
+    bse_symbol = _pick(bse, ["scrip code", "scripcode", "code", "security code"])
+    bse_name   = _pick(bse, ["security name", "name", "company name"])
+    bse_isin   = _pick(bse, ["isin no", "isin", "isin number", "isin code"], default="")
+
+    bse_df = pd.DataFrame({
+        "symbol": bse_symbol.astype(str).str.strip() if bse_symbol is not None else pd.Series(dtype=str),
+        "exchange": "BSE",
+        "name": bse_name.astype(str).str.strip() if bse_name is not None else "",
+        "isin": bse_isin.astype(str).str.strip() if isinstance(bse_isin, pd.Series) else ""
+    })
+    bse_df = bse_df.dropna(subset=["symbol"])
+    bse_df = bse_df[bse_df["symbol"].astype(str).str.len() > 0]
+
+    # Combine
+    uni = pd.concat([nse_df, bse_df], ignore_index=True)
     uni["symbol"] = uni["symbol"].astype(str).str.strip()
     uni["name"] = uni["name"].astype(str).str.strip()
     uni["isin"] = uni["isin"].astype(str).str.strip()
-    return uni
+
+    return uni[["symbol", "exchange", "name", "isin"]]
 
 def upsert_universe(df: pd.DataFrame) -> None:
     with db() as con:
