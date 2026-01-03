@@ -1,5 +1,12 @@
+import os
+import sys
 import datetime as dt
 import pandas as pd
+
+# ✅ Make repo root importable so "import lib.*" works in GitHub Actions
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from lib.db import init_db, db
 from lib.universe import fetch_universe, upsert_universe, get_universe
@@ -20,7 +27,9 @@ def upsert_news_row(symbol: str, exchange: str, date: str, mentions: int, headli
 def upsert_prices(symbol: str, exchange: str, df: pd.DataFrame):
     if df.empty:
         return
-    rows = [(symbol, exchange, r.date, float(r.close) if pd.notna(r.close) else None, float(r.volume) if pd.notna(r.volume) else None)
+    rows = [(symbol, exchange, r.date,
+             float(r.close) if pd.notna(r.close) else None,
+             float(r.volume) if pd.notna(r.volume) else None)
             for r in df.itertuples(index=False)]
     with db() as con:
         con.executemany("""
@@ -43,7 +52,6 @@ def main():
     # 1) Universe refresh
     uni = fetch_universe()
     upsert_universe(uni)
-
     uni = get_universe()
 
     # 2) Only compute signals for your watchlist (fast)
