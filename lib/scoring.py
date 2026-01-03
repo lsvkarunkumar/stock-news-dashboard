@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 
-# ---------------- Helpers ----------------
 def _ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
 
@@ -14,8 +13,7 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     ema_down = down.ewm(alpha=1/period, adjust=False).mean()
 
     rs = ema_up / ema_down.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def _safe_last(s: pd.Series):
     if s is None or len(s) == 0:
@@ -26,19 +24,16 @@ def _safe_last(s: pd.Series):
     return float(s.iloc[-1])
 
 def _pct(a, b):
-    # returns % change from b to a
     if b is None or pd.isna(b) or b == 0 or a is None or pd.isna(a):
         return np.nan
     return (a / b - 1.0) * 100.0
 
-# ---------------- Scoring ----------------
 def indicator_features(prices: pd.DataFrame) -> dict:
     """
-    prices: DataFrame with columns ['date','close','volume'] (daily preferred).
-    Returns a dict of computed features.
+    prices: DataFrame with columns ['date','close','volume']
+    Returns indicator features dict. Needs >= 60 rows for stability.
     """
     out = {}
-
     if prices is None or not isinstance(prices, pd.DataFrame) or prices.empty:
         return out
     if "close" not in prices.columns:
@@ -54,7 +49,7 @@ def indicator_features(prices: pd.DataFrame) -> dict:
 
     df = df.dropna(subset=["date", "close"]).sort_values("date")
     if len(df) < 60:
-        return out  # need enough history for stable signals
+        return out
 
     close = df["close"]
     vol = df["volume"]
@@ -71,7 +66,6 @@ def indicator_features(prices: pd.DataFrame) -> dict:
 
     rsi14 = _rsi(close, 14)
 
-    # Momentum returns
     c_last = _safe_last(close)
     c_20 = _safe_last(close.shift(20))
     c_60 = _safe_last(close.shift(60))
@@ -81,16 +75,13 @@ def indicator_features(prices: pd.DataFrame) -> dict:
     ret_3m = _pct(c_last, c_60)
     ret_6m = _pct(c_last, c_120)
 
-    # Volatility (20d)
     ret_daily = close.pct_change()
     vol20 = _safe_last(ret_daily.rolling(20).std())  # fraction
 
-    # Drawdown (from 52w high)
     roll_high_252 = close.rolling(252).max()
     dd_from_high = (close / roll_high_252 - 1.0) * 100.0
     dd_last = _safe_last(dd_from_high)
 
-    # Volume confirmation: last volume vs 20d avg
     vol20_avg = vol.rolling(20).mean()
     vol_ratio = _safe_last(vol / vol20_avg)
 
@@ -112,13 +103,9 @@ def indicator_features(prices: pd.DataFrame) -> dict:
 
 def indicator_score(features: dict) -> tuple[int, dict]:
     """
-    Produces IndicatorScore 0..100 and a breakdown dict.
-    Weight philosophy (80% of CombinedScore later):
-      - Trend (30)
-      - Momentum (25)
-      - RSI health (15)
-      - Volume confirmation (10)
-      - Risk control: volatility + drawdown (20)
+    Returns (IndicatorScore 0..100, breakdown dict)
+    Weights:
+      Trend 30, Momentum 25, RSI 15, Volume 10, Risk 20
     """
     if not features:
         return 0, {"reason": "Insufficient price history"}
@@ -139,7 +126,7 @@ def indicator_score(features: dict) -> tuple[int, dict]:
     vol20 = features.get("vol20")
     dd = features.get("dd_from_52w_high")
 
-    # 1) Trend (30)
+    # Trend (30)
     trend_pts = 0
     if pd.notna(close) and pd.notna(sma50) and close > sma50:
         trend_pts += 12
@@ -150,9 +137,9 @@ def indicator_score(features: dict) -> tuple[int, dict]:
     score += trend_pts
     breakdown["trend_pts"] = trend_pts
 
-    # 2) Momentum (25) – reward consistent gains
+    # Momentum (25)
     mom_pts = 0
-    for label, r, pts in [("1m", ret_1m, 7), ("3m", ret_3m, 9), ("6m", ret_6m, 9)]:
+    for r, pts in [(ret_1m, 7), (ret_3m, 9), (ret_6m, 9)]:
         if pd.notna(r):
             if r > 10:
                 mom_pts += pts
@@ -160,16 +147,13 @@ def indicator_score(features: dict) -> tuple[int, dict]:
                 mom_pts += int(pts * 0.6)
             elif r > -5:
                 mom_pts += int(pts * 0.25)
-            else:
-                mom_pts += 0
-    # MACD confirmation (small boost)
     if pd.notna(macd_hist) and macd_hist > 0:
         mom_pts += 2
     mom_pts = min(25, mom_pts)
     score += mom_pts
     breakdown["momentum_pts"] = mom_pts
 
-    # 3) RSI health (15) – prefer 45–65, avoid extreme
+    # RSI health (15)
     rsi_pts = 0
     if pd.notna(rsi):
         if 45 <= rsi <= 65:
@@ -178,12 +162,10 @@ def indicator_score(features: dict) -> tuple[int, dict]:
             rsi_pts = 10
         elif 25 <= rsi < 35 or 75 < rsi <= 85:
             rsi_pts = 5
-        else:
-            rsi_pts = 0
     score += rsi_pts
     breakdown["rsi_pts"] = rsi_pts
 
-    # 4) Volume confirmation (10)
+    # Volume confirmation (10)
     vol_pts = 0
     if pd.notna(vol_ratio):
         if vol_ratio >= 1.5:
@@ -192,14 +174,11 @@ def indicator_score(features: dict) -> tuple[int, dict]:
             vol_pts = 7
         elif vol_ratio >= 0.9:
             vol_pts = 4
-        else:
-            vol_pts = 0
     score += vol_pts
     breakdown["volume_pts"] = vol_pts
 
-    # 5) Risk control (20): lower vol + not too far from high
+    # Risk control (20)
     risk_pts = 0
-    # Volatility: prefer < 2% daily std (0.02)
     if pd.notna(vol20):
         if vol20 <= 0.015:
             risk_pts += 10
@@ -207,19 +186,13 @@ def indicator_score(features: dict) -> tuple[int, dict]:
             risk_pts += 6
         elif vol20 <= 0.04:
             risk_pts += 3
-        else:
-            risk_pts += 0
-    # Drawdown: prefer not crushed; but allow some discount
     if pd.notna(dd):
-        # dd is negative if below high
         if dd >= -10:
             risk_pts += 10
         elif dd >= -25:
             risk_pts += 7
         elif dd >= -45:
             risk_pts += 4
-        else:
-            risk_pts += 0
     risk_pts = min(20, risk_pts)
     score += risk_pts
     breakdown["risk_pts"] = risk_pts
