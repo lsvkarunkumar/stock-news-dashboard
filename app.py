@@ -35,7 +35,6 @@ with st.sidebar:
     page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=0)
     st.divider()
     debug_on = st.toggle("Debug mode", value=False)
-    st.caption("Live = latest available from free feeds (may be delayed).")
 
 # ---------------- Helpers ----------------
 def is_valid_url(x):
@@ -115,21 +114,6 @@ def upsert_signal(symbol, exchange, asof, score, reasons):
         """, (symbol, exchange, asof, int(score), reasons))
         con.commit()
 
-def upsert_prices(symbol, exchange, df):
-    if df is None or df.empty:
-        return
-    with db() as con:
-        con.executemany("""
-            INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume)
-            VALUES (?,?,?,?,?)
-        """, [
-            (symbol, exchange, r.date,
-             float(r.close) if pd.notna(r.close) else None,
-             float(r.volume) if pd.notna(r.volume) else None)
-            for r in df.itertuples(index=False)
-        ])
-        con.commit()
-
 def get_prices_from_db(symbol, exchange):
     with db() as con:
         return pd.read_sql_query("""
@@ -138,6 +122,114 @@ def get_prices_from_db(symbol, exchange):
             WHERE symbol=? AND exchange=?
             ORDER BY date
         """, con, params=(symbol, exchange))
+
+# ---------------- Market data (FIXED) ----------------
+def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
+    """
+    Always returns DataFrame with exact columns: date, close, volume
+    date is string. close/volume numeric.
+    """
+    t = to_yahoo_ticker(symbol, exchange)
+
+    # Try intraday first (free live-like)
+    try:
+        raw = yf.download(t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False)
+        if raw is not None and not raw.empty:
+            df = raw.reset_index()
+            dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
+            df["date"] = pd.to_datetime(df[dt_col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+
+            close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
+            vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
+
+            if close_col is None:
+                return pd.DataFrame(columns=["date", "close", "volume"])
+
+            df["close"] = pd.to_numeric(df[close_col], errors="coerce")
+            df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
+
+            out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+            return out
+    except Exception:
+        pass
+
+    # Fallback daily
+    try:
+        raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame(columns=["date", "close", "volume"])
+
+        df = raw.reset_index()
+        dcol = "Date" if "Date" in df.columns else df.columns[0]
+        df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
+
+        close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
+        vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
+
+        if close_col is None:
+            return pd.DataFrame(columns=["date", "close", "volume"])
+
+        df["close"] = pd.to_numeric(df[close_col], errors="coerce")
+        df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
+
+        out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["date", "close", "volume"])
+
+@st.cache_data(ttl=5*60, show_spinner=False)
+def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
+    # daily only (for metrics)
+    t = to_yahoo_ticker(symbol, exchange)
+    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["date", "close", "volume"])
+    df = raw.reset_index()
+    dcol = "Date" if "Date" in df.columns else df.columns[0]
+    df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
+
+    close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
+    vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
+
+    if close_col is None:
+        return pd.DataFrame(columns=["date", "close", "volume"])
+
+    df["close"] = pd.to_numeric(df[close_col], errors="coerce")
+    df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
+    return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+
+def upsert_prices(symbol, exchange, df):
+    """
+    Safe insert: never assumes df.itertuples has .date.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    if "date" not in df.columns or "close" not in df.columns:
+        return
+
+    rows = []
+    for _, r in df.iterrows():
+        d = r.get("date")
+        c = r.get("close")
+        v = r.get("volume", None)
+        if pd.isna(d) or pd.isna(c):
+            continue
+        rows.append((
+            str(symbol).strip().upper(),
+            str(exchange).strip().upper(),
+            str(d),
+            float(c) if pd.notna(c) else None,
+            float(v) if pd.notna(v) else None
+        ))
+    if not rows:
+        return
+
+    with db() as con:
+        con.executemany("""
+            INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume)
+            VALUES (?,?,?,?,?)
+        """, rows)
+        con.commit()
 
 # ---------------- RSS news -> DB ----------------
 def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int = 60) -> int:
@@ -163,8 +255,8 @@ def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int =
     return len(items)
 
 def rss_counts(symbol: str, exchange: str):
-    symbol = str(symbol).strip().str.upper()
-    exchange = str(exchange).strip().str.upper()
+    symbol = str(symbol).strip().upper()
+    exchange = str(exchange).strip().upper()
     today = dt.date.today()
 
     with db() as con:
@@ -192,11 +284,9 @@ def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
     baseline = max(1.0, m60 / 12.0)  # 60 days => 12 buckets of 5 days
     intensity_ratio = m5 / baseline
 
-    # 0..60 intensity
     intensity_pts = (intensity_ratio - 0.5) * 30.0
     intensity_pts = float(max(0.0, min(60.0, intensity_pts)))
 
-    # 0..40 recency
     if recency_days <= 2:
         recency_pts = 40
     elif recency_days <= 5:
@@ -223,50 +313,13 @@ def latest_rss_headlines(symbol: str, exchange: str, limit: int = 12) -> pd.Data
             LIMIT ?
         """, con, params=(symbol, exchange, int(limit)))
 
-# ---------------- Market data ----------------
-def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
-    t = to_yahoo_ticker(symbol, exchange)
-
-    # Try intraday 1m
-    try:
-        df = yf.download(t, period="1d", interval="1m", progress=False, threads=True)
-        if df is not None and not df.empty:
-            df = df.reset_index()
-            dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
-            df["date"] = pd.to_datetime(df[dt_col]).dt.strftime("%Y-%m-%d %H:%M")
-            df = df.rename(columns={"Close": "close", "Volume": "volume"})
-            return df[["date", "close", "volume"]]
-    except Exception:
-        pass
-
-    # Fallback daily
-    df = yf.download(t, period="370d", interval="1d", progress=False, threads=True)
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-    df = df.reset_index()
-    df["date"] = pd.to_datetime(df["Date"]).dt.date.astype(str)
-    df = df.rename(columns={"Close": "close", "Volume": "volume"})
-    return df[["date", "close", "volume"]]
-
-@st.cache_data(ttl=5*60, show_spinner=False)
-def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
-    t = to_yahoo_ticker(symbol, exchange)
-    df = yf.download(t, period="370d", interval="1d", progress=False, threads=True)
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-    df = df.reset_index()
-    df["date"] = pd.to_datetime(df["Date"]).dt.date.astype(str)
-    df = df.rename(columns={"Close": "close", "Volume": "volume"})
-    return df[["date", "close", "volume"]]
-
-# --------- CRASH FIXED HERE: robust metrics ---------
+# --------- Metrics (safe) ---------
 def compute_metrics(df: pd.DataFrame) -> dict:
     out = {
         "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
         "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
         "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
     }
-
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return out
     if "close" not in df.columns:
@@ -274,13 +327,10 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
     close_col = df["close"]
     if isinstance(close_col, pd.DataFrame):
-        close = close_col.iloc[:, 0]  # take first if multi
+        close = close_col.iloc[:, 0]
     else:
         close = close_col
-
-    if not isinstance(close, pd.Series):
-        return out
-    if close.dropna().empty:
+    if not isinstance(close, pd.Series) or close.dropna().empty:
         return out
 
     d = df.copy()
@@ -320,12 +370,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     return out
 
 def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
-    """
-    Adds live/52W/returns for top rows. Never crashes the app.
-    """
     if df is None or df.empty:
         return df
-
     take = df.head(max_rows).copy()
     metrics = []
     for r in take.itertuples(index=False):
@@ -338,7 +384,6 @@ def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
                 "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
                 "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
             })
-
     met = pd.DataFrame(metrics)
     take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
     rest = df.iloc[max_rows:].copy()
@@ -356,11 +401,9 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
     except Exception:
         pass
 
-    # prices
     px = yf_history_force(symbol, exchange)
     upsert_prices(symbol, exchange, px)
 
-    # rss ingest + score
     fetched = 0
     try:
         fetched = upsert_news_items(symbol, exchange, name, days=60)
@@ -377,7 +420,6 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
         "mentions_60d": m60,
         "recency_days": recency_days,
         "news_score": nscore,
-        "note": "Next step: IndicatorScore (80%) + CombinedScore + Manual Confidence + Auto/Manual paper trading"
     }
     upsert_signal(symbol, exchange, asof, nscore, json.dumps(reasons))
     return {"ok": True, "news_score": nscore, "fetched": fetched}
@@ -400,12 +442,9 @@ if page == "Discover & Add":
 
     uni, _ = ensure_universe_loaded()
     uni = uni.copy()
-
-    uni["sector"] = uni.get("sector", "Unknown")
-    if "sector" in uni.columns:
-        uni["sector"] = uni["sector"].fillna("Unknown")
-    else:
+    if "sector" not in uni.columns:
         uni["sector"] = "Unknown"
+    uni["sector"] = uni["sector"].fillna("Unknown")
 
     uni["symbol"] = uni["symbol"].astype(str).str.strip().str.upper()
     uni["exchange"] = uni["exchange"].astype(str).str.strip().str.upper()
@@ -428,17 +467,16 @@ if page == "Discover & Add":
             show["name"].astype(str).str.contains(q, case=False, na=False)
         )
         show = show[mask]
-
     show = show.head(250).copy()
 
-    # Bring in latest score
     sig = latest_signals_per_stock()
-    show = show.merge(sig[["symbol", "exchange", "score"]], on=["symbol", "exchange"], how="left")
+    if not sig.empty:
+        show = show.merge(sig[["symbol", "exchange", "score"]], on=["symbol", "exchange"], how="left")
+    else:
+        show["score"] = 0
     show["score"] = show["score"].fillna(0).astype(int)
 
     show.insert(0, "add", False)
-
-    # Enrich (robust)
     show = enrich_with_metrics(show, max_rows=30)
 
     add_btn = st.button("➕ Add selected to Watchlist", use_container_width=True)
@@ -491,9 +529,15 @@ elif page == "Watchlist":
         view = view[view["sector"].isin(pick_sectors)].copy()
 
     sig = latest_signals_per_stock()
-    df = view.merge(sig[["symbol", "exchange", "score", "reasons", "asof"]], on=["symbol", "exchange"], how="left")
-    df["score"] = df["score"].fillna(0).astype(int)
+    if not sig.empty:
+        df = view.merge(sig[["symbol", "exchange", "score", "reasons", "asof"]], on=["symbol", "exchange"], how="left")
+    else:
+        df = view.copy()
+        df["score"] = 0
+        df["reasons"] = None
+        df["asof"] = None
 
+    df["score"] = df["score"].fillna(0).astype(int)
     df = enrich_with_metrics(df, max_rows=30)
     df = df.sort_values(["score"], ascending=False).copy()
     df.insert(0, "delete", False)
