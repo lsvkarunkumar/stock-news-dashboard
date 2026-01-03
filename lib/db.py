@@ -1,25 +1,23 @@
-import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
 DB_PATH = Path("data") / "app.db"
 
+
 def _ensure_paths():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+
 @contextmanager
 def db():
-    """
-    Always opens the SAME sqlite file: data/app.db
-    Streamlit can write to repo workspace, so this should work.
-    """
     _ensure_paths()
     con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     try:
         yield con
     finally:
         con.close()
+
 
 def init_db():
     _ensure_paths()
@@ -48,7 +46,7 @@ def init_db():
         )
         """)
 
-        # Prices (daily/intraday)
+        # Prices
         cur.execute("""
         CREATE TABLE IF NOT EXISTS prices (
             symbol TEXT NOT NULL,
@@ -60,20 +58,20 @@ def init_db():
         )
         """)
 
-        # News mentions snapshots
+        # RSS News items (raw headlines)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS news_mentions (
+        CREATE TABLE IF NOT EXISTS news_items (
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
-            date TEXT NOT NULL,
-            mentions INTEGER,
-            sample_headline TEXT,
-            sample_url TEXT,
-            PRIMARY KEY(symbol, exchange, date)
+            published TEXT,
+            title TEXT,
+            url TEXT,
+            source TEXT,
+            PRIMARY KEY(symbol, exchange, published, title)
         )
         """)
 
-        # Signals snapshots
+        # Signals (Score snapshots)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             symbol TEXT NOT NULL,
@@ -85,7 +83,7 @@ def init_db():
         )
         """)
 
-        # Paper trading
+        # Paper trading (single wallet for now; we’ll split Auto/Manual next step)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS paper_wallet (
             id INTEGER PRIMARY KEY,
@@ -106,9 +104,9 @@ def init_db():
         )
         """)
 
-        # Helpful indexes
+        # Indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_prices_symex ON prices(symbol, exchange)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_symex ON news_mentions(symbol, exchange)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_symex ON signals(symbol, exchange)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_items_symex ON news_items(symbol, exchange)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symex ON signals(symbol, exchange)")
 
         con.commit()
