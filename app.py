@@ -16,6 +16,7 @@ from lib.news_rss import fetch_google_news_rss
 
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
 
+
 # ---------------- Init ----------------
 def load_css():
     try:
@@ -23,6 +24,7 @@ def load_css():
             st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
     except Exception:
         pass
+
 
 init_db()
 load_css()
@@ -36,6 +38,7 @@ with st.sidebar:
     st.divider()
     debug_on = st.toggle("Debug mode", value=False)
 
+
 # ---------------- Helpers ----------------
 def is_valid_url(x):
     if x is None:
@@ -47,6 +50,7 @@ def is_valid_url(x):
     x = x.strip()
     return x.startswith("http://") or x.startswith("https://")
 
+
 def ensure_universe_loaded():
     uni = get_universe()
     if len(uni) > 0:
@@ -55,11 +59,13 @@ def ensure_universe_loaded():
     upsert_universe(fresh)
     return get_universe(), True
 
+
 def normalize_df(rows: pd.DataFrame) -> pd.DataFrame:
     clean = rows.copy()
     clean["symbol"] = clean["symbol"].astype(str).str.strip().str.upper()
     clean["exchange"] = clean["exchange"].astype(str).str.strip().str.upper()
     return clean.drop_duplicates(subset=["symbol", "exchange"])
+
 
 # ---------------- DB ops ----------------
 def add_to_watchlist_bulk(rows: pd.DataFrame):
@@ -69,9 +75,10 @@ def add_to_watchlist_bulk(rows: pd.DataFrame):
     with db() as con:
         con.executemany(
             "INSERT OR IGNORE INTO watchlist(symbol, exchange, added_at) VALUES (?,?,?)",
-            [(r.symbol, r.exchange, date.today().isoformat()) for r in clean.itertuples(index=False)]
+            [(r.symbol, r.exchange, date.today().isoformat()) for r in clean.itertuples(index=False)],
         )
         con.commit()
+
 
 def remove_from_watchlist_bulk(rows: pd.DataFrame):
     if rows is None or rows.empty:
@@ -80,22 +87,28 @@ def remove_from_watchlist_bulk(rows: pd.DataFrame):
     with db() as con:
         con.executemany(
             "DELETE FROM watchlist WHERE symbol=? AND exchange=?",
-            [(r.symbol, r.exchange) for r in clean.itertuples(index=False)]
+            [(r.symbol, r.exchange) for r in clean.itertuples(index=False)],
         )
         con.commit()
 
+
 def get_watchlist_df():
     with db() as con:
-        return pd.read_sql_query("""
+        return pd.read_sql_query(
+            """
             SELECT w.symbol, w.exchange, u.name, COALESCE(u.sector,'Unknown') AS sector, COALESCE(u.isin,'') AS isin, w.added_at
             FROM watchlist w
             LEFT JOIN universe u ON u.symbol=w.symbol AND u.exchange=w.exchange
             ORDER BY w.added_at DESC
-        """, con)
+            """,
+            con,
+        )
+
 
 def latest_signals_per_stock():
     with db() as con:
-        return pd.read_sql_query("""
+        return pd.read_sql_query(
+            """
             SELECT s.*
             FROM signals s
             JOIN (
@@ -104,26 +117,38 @@ def latest_signals_per_stock():
                 GROUP BY symbol, exchange
             ) t
             ON s.symbol=t.symbol AND s.exchange=t.exchange AND s.asof=t.max_asof
-        """, con)
+            """,
+            con,
+        )
+
 
 def upsert_signal(symbol, exchange, asof, score, reasons):
     with db() as con:
-        con.execute("""
+        con.execute(
+            """
             INSERT OR REPLACE INTO signals(symbol, exchange, asof, score, reasons)
             VALUES (?,?,?,?,?)
-        """, (symbol, exchange, asof, int(score), reasons))
+            """,
+            (symbol, exchange, asof, int(score), reasons),
+        )
         con.commit()
+
 
 def get_prices_from_db(symbol, exchange):
     with db() as con:
-        return pd.read_sql_query("""
+        return pd.read_sql_query(
+            """
             SELECT date, close, volume
             FROM prices
             WHERE symbol=? AND exchange=?
             ORDER BY date
-        """, con, params=(symbol, exchange))
+            """,
+            con,
+            params=(symbol, exchange),
+        )
 
-# ---------------- Market data (FIXED) ----------------
+
+# ---------------- Market data (safe) ----------------
 def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
     """
     Always returns DataFrame with exact columns: date, close, volume
@@ -131,9 +156,11 @@ def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
     """
     t = to_yahoo_ticker(symbol, exchange)
 
-    # Try intraday first (free live-like)
+    # Intraday first (1m)
     try:
-        raw = yf.download(t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False)
+        raw = yf.download(
+            t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False
+        )
         if raw is not None and not raw.empty:
             df = raw.reset_index()
             dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
@@ -153,9 +180,11 @@ def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback daily
+    # Daily fallback (370d)
     try:
-        raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+        raw = yf.download(
+            t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False
+        )
         if raw is None or raw.empty:
             return pd.DataFrame(columns=["date", "close", "volume"])
 
@@ -177,20 +206,25 @@ def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=["date", "close", "volume"])
 
-@st.cache_data(ttl=5*60, show_spinner=False)
+
+@st.cache_data(ttl=5 * 60, show_spinner=False)
 def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
-    # daily only (for metrics)
+    """
+    Daily prices for metrics (cached).
+    """
     t = to_yahoo_ticker(symbol, exchange)
-    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+    raw = yf.download(
+        t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False
+    )
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date", "close", "volume"])
+
     df = raw.reset_index()
     dcol = "Date" if "Date" in df.columns else df.columns[0]
     df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
 
     close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
     vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
-
     if close_col is None:
         return pd.DataFrame(columns=["date", "close", "volume"])
 
@@ -198,9 +232,10 @@ def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
     df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
     return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
 
+
 def upsert_prices(symbol, exchange, df):
     """
-    Safe insert: never assumes df.itertuples has .date.
+    Safe insert. Never assumes df.itertuples has r.date attribute.
     """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return
@@ -214,22 +249,28 @@ def upsert_prices(symbol, exchange, df):
         v = r.get("volume", None)
         if pd.isna(d) or pd.isna(c):
             continue
-        rows.append((
-            str(symbol).strip().upper(),
-            str(exchange).strip().upper(),
-            str(d),
-            float(c) if pd.notna(c) else None,
-            float(v) if pd.notna(v) else None
-        ))
+        rows.append(
+            (
+                str(symbol).strip().upper(),
+                str(exchange).strip().upper(),
+                str(d),
+                float(c) if pd.notna(c) else None,
+                float(v) if pd.notna(v) else None,
+            )
+        )
     if not rows:
         return
 
     with db() as con:
-        con.executemany("""
+        con.executemany(
+            """
             INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume)
             VALUES (?,?,?,?,?)
-        """, rows)
+            """,
+            rows,
+        )
         con.commit()
+
 
 # ---------------- RSS news -> DB ----------------
 def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int = 60) -> int:
@@ -242,17 +283,20 @@ def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int =
         return 0
 
     with db() as con:
-        con.executemany("""
+        con.executemany(
+            """
             INSERT OR IGNORE INTO news_items
             (symbol, exchange, published, title, url, source)
             VALUES (?,?,?,?,?,?)
-        """, [
-            (symbol, exchange, it["published"], it["title"], it["url"], it["source"])
-            for it in items
-        ])
+            """,
+            [
+                (symbol, exchange, it["published"], it["title"], it["url"], it["source"])
+                for it in items
+            ],
+        )
         con.commit()
-
     return len(items)
+
 
 def rss_counts(symbol: str, exchange: str):
     symbol = str(symbol).strip().upper()
@@ -260,11 +304,15 @@ def rss_counts(symbol: str, exchange: str):
     today = dt.date.today()
 
     with db() as con:
-        df = pd.read_sql_query("""
+        df = pd.read_sql_query(
+            """
             SELECT published
             FROM news_items
             WHERE symbol=? AND exchange=?
-        """, con, params=(symbol, exchange))
+            """,
+            con,
+            params=(symbol, exchange),
+        )
 
     if df.empty:
         return 0, 0, 999
@@ -279,6 +327,7 @@ def rss_counts(symbol: str, exchange: str):
     last = df["published"].max()
     recency_days = (today - last).days if last else 999
     return m5, m60, recency_days
+
 
 def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
     baseline = max(1.0, m60 / 12.0)  # 60 days => 12 buckets of 5 days
@@ -301,24 +350,36 @@ def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
     score = int(round(min(100.0, intensity_pts + recency_pts)))
     return max(0, min(100, score))
 
-def latest_rss_headlines(symbol: str, exchange: str, limit: int = 12) -> pd.DataFrame:
+
+def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.DataFrame:
     symbol = str(symbol).strip().upper()
     exchange = str(exchange).strip().upper()
     with db() as con:
-        return pd.read_sql_query("""
+        return pd.read_sql_query(
+            """
             SELECT published, title, url, source
             FROM news_items
             WHERE symbol=? AND exchange=?
             ORDER BY published DESC
             LIMIT ?
-        """, con, params=(symbol, exchange, int(limit)))
+            """,
+            con,
+            params=(symbol, exchange, int(limit)),
+        )
+
 
 # --------- Metrics (safe) ---------
 def compute_metrics(df: pd.DataFrame) -> dict:
     out = {
-        "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
-        "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
-        "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
+        "live": np.nan,
+        "52w_high": np.nan,
+        "52w_low": np.nan,
+        "ret_1d": np.nan,
+        "ret_1w": np.nan,
+        "ret_1m": np.nan,
+        "ret_3m": np.nan,
+        "ret_6m": np.nan,
+        "ret_12m": np.nan,
     }
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return out
@@ -361,13 +422,14 @@ def compute_metrics(df: pd.DataFrame) -> dict:
             return np.nan
         return (last_close / base - 1.0) * 100.0
 
-    out["ret_1d"]  = ret(1)
-    out["ret_1w"]  = ret(7)
-    out["ret_1m"]  = ret(30)
-    out["ret_3m"]  = ret(90)
-    out["ret_6m"]  = ret(180)
+    out["ret_1d"] = ret(1)
+    out["ret_1w"] = ret(7)
+    out["ret_1m"] = ret(30)
+    out["ret_3m"] = ret(90)
+    out["ret_6m"] = ret(180)
     out["ret_12m"] = ret(365)
     return out
+
 
 def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
     if df is None or df.empty:
@@ -379,15 +441,24 @@ def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
             h = yf_history_cached_daily(r.symbol, r.exchange)
             metrics.append(compute_metrics(h))
         except Exception:
-            metrics.append({
-                "live": np.nan, "52w_high": np.nan, "52w_low": np.nan,
-                "ret_1d": np.nan, "ret_1w": np.nan, "ret_1m": np.nan,
-                "ret_3m": np.nan, "ret_6m": np.nan, "ret_12m": np.nan,
-            })
+            metrics.append(
+                {
+                    "live": np.nan,
+                    "52w_high": np.nan,
+                    "52w_low": np.nan,
+                    "ret_1d": np.nan,
+                    "ret_1w": np.nan,
+                    "ret_1m": np.nan,
+                    "ret_3m": np.nan,
+                    "ret_6m": np.nan,
+                    "ret_12m": np.nan,
+                }
+            )
     met = pd.DataFrame(metrics)
     take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
     rest = df.iloc[max_rows:].copy()
     return pd.concat([take2, rest], axis=0, ignore_index=True)
+
 
 # ---------------- Refresh (RSS Score) ----------------
 def refresh_one_stock(symbol: str, exchange: str, name: str):
@@ -424,6 +495,7 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
     upsert_signal(symbol, exchange, asof, nscore, json.dumps(reasons))
     return {"ok": True, "news_score": nscore, "fetched": fetched}
 
+
 # ---------------- Debug panel ----------------
 if debug_on:
     with st.expander("🧪 Debug panel", expanded=False):
@@ -435,6 +507,7 @@ if debug_on:
             c_news = con.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
             c_sig = con.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
         st.write({"universe": c_univ, "watchlist": c_wl, "prices": c_px, "news_items": c_news, "signals": c_sig})
+
 
 # ========================= PAGES =========================
 if page == "Discover & Add":
@@ -463,8 +536,8 @@ if page == "Discover & Add":
         show = show[show["sector"].isin(sectors)]
     if q:
         mask = (
-            show["symbol"].str.contains(q, case=False, na=False) |
-            show["name"].astype(str).str.contains(q, case=False, na=False)
+            show["symbol"].str.contains(q, case=False, na=False)
+            | show["name"].astype(str).str.contains(q, case=False, na=False)
         )
         show = show[mask]
     show = show.head(250).copy()
@@ -482,12 +555,25 @@ if page == "Discover & Add":
     add_btn = st.button("➕ Add selected to Watchlist", use_container_width=True)
 
     edited = st.data_editor(
-        show[[
-            "add", "exchange", "symbol", "name", "sector",
-            "score",
-            "live", "52w_high", "52w_low",
-            "ret_1d", "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_12m"
-        ]],
+        show[
+            [
+                "add",
+                "exchange",
+                "symbol",
+                "name",
+                "sector",
+                "score",
+                "live",
+                "52w_high",
+                "52w_low",
+                "ret_1d",
+                "ret_1w",
+                "ret_1m",
+                "ret_3m",
+                "ret_6m",
+                "ret_12m",
+            ]
+        ],
         use_container_width=True,
         height=560,
         hide_index=True,
@@ -503,7 +589,7 @@ if page == "Discover & Add":
             "ret_3m": st.column_config.NumberColumn("3M %", format="%.2f"),
             "ret_6m": st.column_config.NumberColumn("6M %", format="%.2f"),
             "ret_12m": st.column_config.NumberColumn("12M %", format="%.2f"),
-        }
+        },
     )
 
     selected = edited[edited["add"] == True][["symbol", "exchange"]].drop_duplicates()
@@ -513,6 +599,7 @@ if page == "Discover & Add":
         add_to_watchlist_bulk(selected)
         st.success("Added to watchlist.")
         st.rerun()
+
 
 elif page == "Watchlist":
     st.subheader("Watchlist (live stats + delete + story)")
@@ -549,12 +636,25 @@ elif page == "Watchlist":
         st.caption("Use Story panel refresh to update RSS NewsScore + prices.")
 
     edited = st.data_editor(
-        df[[
-            "delete", "exchange", "symbol", "name", "sector",
-            "score",
-            "live", "52w_high", "52w_low",
-            "ret_1d", "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_12m"
-        ]],
+        df[
+            [
+                "delete",
+                "exchange",
+                "symbol",
+                "name",
+                "sector",
+                "score",
+                "live",
+                "52w_high",
+                "52w_low",
+                "ret_1d",
+                "ret_1w",
+                "ret_1m",
+                "ret_3m",
+                "ret_6m",
+                "ret_12m",
+            ]
+        ],
         use_container_width=True,
         height=520,
         hide_index=True,
@@ -570,7 +670,7 @@ elif page == "Watchlist":
             "ret_3m": st.column_config.NumberColumn("3M %", format="%.2f"),
             "ret_6m": st.column_config.NumberColumn("6M %", format="%.2f"),
             "ret_12m": st.column_config.NumberColumn("12M %", format="%.2f"),
-        }
+        },
     )
 
     to_del = edited[edited["delete"] == True][["symbol", "exchange"]].drop_duplicates()
@@ -596,44 +696,39 @@ elif page == "Watchlist":
         st.success(f"Refreshed. NewsScore={res.get('news_score')}  (fetched={res.get('fetched')})")
         st.rerun()
 
-st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
+    # -------- GROUPED RSS HEADLINES (DATE-WISE) --------
+    st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
 
-h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
-
-if h is None or h.empty:
-    st.info("No RSS headlines stored yet. Click refresh once.")
-else:
-    h = h.copy()
-
-    # Normalize dates
-    h["published"] = pd.to_datetime(h["published"], errors="coerce").dt.date
-    h = h.dropna(subset=["published"])
-
-    if h.empty:
-        st.info("No valid-dated headlines available.")
+    h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
+    if h is None or h.empty:
+        st.info("No RSS headlines stored yet. Click refresh once.")
     else:
-        # Sort newest date first
-        h = h.sort_values("published", ascending=False)
+        h = h.copy()
+        h["published"] = pd.to_datetime(h["published"], errors="coerce").dt.date
+        h = h.dropna(subset=["published"])
 
-        # Remove duplicate titles (case-insensitive)
-        h["_t"] = h["title"].astype(str).str.strip().str.lower()
-        h = h.drop_duplicates(subset=["published", "_t"])
-        h = h.drop(columns=["_t"])
+        if h.empty:
+            st.info("No valid-dated headlines available.")
+        else:
+            # De-duplicate titles per date (case-insensitive)
+            h["_t"] = h["title"].astype(str).str.strip().str.lower()
+            h = h.drop_duplicates(subset=["published", "_t"]).drop(columns=["_t"])
 
-        latest_date = h["published"].max()
+            latest_date = h["published"].max()
+            unique_dates = sorted(h["published"].unique(), reverse=True)
 
-        for pub_date in sorted(h["published"].unique(), reverse=True):
-            day_items = h[h["published"] == pub_date]
+            for pub_date in unique_dates:
+                day_items = h[h["published"] == pub_date].copy()
+                day_items = day_items.sort_values(["source", "title"], ascending=[True, True])
 
-            with st.expander(
-                f"📅 {pub_date} — {len(day_items)} headlines",
-                expanded=(pub_date == latest_date)
-            ):
-                for _, r in day_items.iterrows():
-                    st.write(f"• {r['title']}  ({r['source']})")
-                    if is_valid_url(r["url"]):
-                        st.link_button("Open", r["url"])
-
+                with st.expander(
+                    f"📅 {pub_date} — {len(day_items)} headlines",
+                    expanded=(pub_date == latest_date),
+                ):
+                    for _, rr in day_items.iterrows():
+                        st.write(f"• {rr['title']}  ({rr['source']})")
+                        if is_valid_url(rr["url"]):
+                            st.link_button("Open", rr["url"])
 
     st.markdown("#### 📈 Price chart")
     px = get_prices_from_db(sel_sym, sel_ex)
@@ -654,6 +749,7 @@ else:
             st.json(json.loads(row["reasons"]))
         except Exception:
             pass
+
 
 else:
     st.subheader("Paper Trading (demo)")
