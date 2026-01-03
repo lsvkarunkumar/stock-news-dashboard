@@ -13,11 +13,11 @@ from lib.db import init_db, db, DB_PATH
 from lib.universe import get_universe, fetch_universe, upsert_universe
 from lib.prices import to_yahoo_ticker
 from lib.news_rss import fetch_google_news_rss
+from lib.scoring import indicator_features, indicator_score, combined_score
 
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
 
 
-# ---------------- Init ----------------
 def load_css():
     try:
         with open("assets/style.css", "r", encoding="utf-8") as f:
@@ -39,7 +39,6 @@ with st.sidebar:
     debug_on = st.toggle("Debug mode", value=False)
 
 
-# ---------------- Helpers ----------------
 def is_valid_url(x):
     if x is None:
         return False
@@ -67,7 +66,6 @@ def normalize_df(rows: pd.DataFrame) -> pd.DataFrame:
     return clean.drop_duplicates(subset=["symbol", "exchange"])
 
 
-# ---------------- DB ops ----------------
 def add_to_watchlist_bulk(rows: pd.DataFrame):
     if rows is None or rows.empty:
         return
@@ -122,14 +120,11 @@ def latest_signals_per_stock():
         )
 
 
-def upsert_signal(symbol, exchange, asof, score, reasons):
+def upsert_signal(symbol, exchange, asof, score_val, reasons):
     with db() as con:
         con.execute(
-            """
-            INSERT OR REPLACE INTO signals(symbol, exchange, asof, score, reasons)
-            VALUES (?,?,?,?,?)
-            """,
-            (symbol, exchange, asof, int(score), reasons),
+            "INSERT OR REPLACE INTO signals(symbol, exchange, asof, score, reasons) VALUES (?,?,?,?,?)",
+            (symbol, exchange, asof, int(score_val), json.dumps(reasons)),
         )
         con.commit()
 
@@ -137,106 +132,64 @@ def upsert_signal(symbol, exchange, asof, score, reasons):
 def get_prices_from_db(symbol, exchange):
     with db() as con:
         return pd.read_sql_query(
-            """
-            SELECT date, close, volume
-            FROM prices
-            WHERE symbol=? AND exchange=?
-            ORDER BY date
-            """,
+            "SELECT date, close, volume FROM prices WHERE symbol=? AND exchange=? ORDER BY date",
             con,
             params=(symbol, exchange),
         )
 
 
-# ---------------- Market data (safe) ----------------
 def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
-    """
-    Always returns DataFrame with exact columns: date, close, volume
-    date is string. close/volume numeric.
-    """
     t = to_yahoo_ticker(symbol, exchange)
-
-    # Intraday first (1m)
     try:
-        raw = yf.download(
-            t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False
-        )
+        raw = yf.download(t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False)
         if raw is not None and not raw.empty:
             df = raw.reset_index()
             dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
             df["date"] = pd.to_datetime(df[dt_col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-
-            close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
-            vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
-
+            close_col = "Close" if "Close" in df.columns else None
+            vol_col = "Volume" if "Volume" in df.columns else None
             if close_col is None:
                 return pd.DataFrame(columns=["date", "close", "volume"])
-
             df["close"] = pd.to_numeric(df[close_col], errors="coerce")
             df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
-
-            out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-            return out
+            return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
     except Exception:
         pass
 
-    # Daily fallback (370d)
-    try:
-        raw = yf.download(
-            t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False
-        )
-        if raw is None or raw.empty:
-            return pd.DataFrame(columns=["date", "close", "volume"])
-
-        df = raw.reset_index()
-        dcol = "Date" if "Date" in df.columns else df.columns[0]
-        df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
-
-        close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
-        vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
-
-        if close_col is None:
-            return pd.DataFrame(columns=["date", "close", "volume"])
-
-        df["close"] = pd.to_numeric(df[close_col], errors="coerce")
-        df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
-
-        out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-        return out
-    except Exception:
+    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+    if raw is None or raw.empty:
         return pd.DataFrame(columns=["date", "close", "volume"])
+    df = raw.reset_index()
+    dcol = "Date" if "Date" in df.columns else df.columns[0]
+    df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
+    close_col = "Close" if "Close" in df.columns else None
+    vol_col = "Volume" if "Volume" in df.columns else None
+    if close_col is None:
+        return pd.DataFrame(columns=["date", "close", "volume"])
+    df["close"] = pd.to_numeric(df[close_col], errors="coerce")
+    df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
+    return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
 
 
 @st.cache_data(ttl=5 * 60, show_spinner=False)
 def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
-    """
-    Daily prices for metrics (cached).
-    """
     t = to_yahoo_ticker(symbol, exchange)
-    raw = yf.download(
-        t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False
-    )
+    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date", "close", "volume"])
-
     df = raw.reset_index()
     dcol = "Date" if "Date" in df.columns else df.columns[0]
     df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
-
-    close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
-    vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
+    close_col = "Close" if "Close" in df.columns else None
+    vol_col = "Volume" if "Volume" in df.columns else None
     if close_col is None:
         return pd.DataFrame(columns=["date", "close", "volume"])
-
     df["close"] = pd.to_numeric(df[close_col], errors="coerce")
     df["volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else np.nan
     return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
 
 
 def upsert_prices(symbol, exchange, df):
-    """
-    Safe insert. Never assumes df.itertuples has r.date attribute.
-    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return
     if "date" not in df.columns or "close" not in df.columns:
@@ -249,79 +202,49 @@ def upsert_prices(symbol, exchange, df):
         v = r.get("volume", None)
         if pd.isna(d) or pd.isna(c):
             continue
-        rows.append(
-            (
-                str(symbol).strip().upper(),
-                str(exchange).strip().upper(),
-                str(d),
-                float(c) if pd.notna(c) else None,
-                float(v) if pd.notna(v) else None,
-            )
-        )
+        rows.append((symbol, exchange, str(d), float(c), float(v) if pd.notna(v) else None))
+
     if not rows:
         return
 
     with db() as con:
         con.executemany(
-            """
-            INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume)
-            VALUES (?,?,?,?,?)
-            """,
+            "INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume) VALUES (?,?,?,?,?)",
             rows,
         )
         con.commit()
 
 
-# ---------------- RSS news -> DB ----------------
 def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int = 60) -> int:
-    symbol = str(symbol).strip().upper()
-    exchange = str(exchange).strip().upper()
-    company_name = str(company_name or "").strip()
-
     items = fetch_google_news_rss(company_name, symbol, days=days)
     if not items:
         return 0
-
     with db() as con:
         con.executemany(
             """
-            INSERT OR IGNORE INTO news_items
-            (symbol, exchange, published, title, url, source)
+            INSERT OR IGNORE INTO news_items(symbol, exchange, published, title, url, source)
             VALUES (?,?,?,?,?,?)
             """,
-            [
-                (symbol, exchange, it["published"], it["title"], it["url"], it["source"])
-                for it in items
-            ],
+            [(symbol, exchange, it["published"], it["title"], it["url"], it["source"]) for it in items],
         )
         con.commit()
     return len(items)
 
 
 def rss_counts(symbol: str, exchange: str):
-    symbol = str(symbol).strip().upper()
-    exchange = str(exchange).strip().upper()
     today = dt.date.today()
-
     with db() as con:
         df = pd.read_sql_query(
-            """
-            SELECT published
-            FROM news_items
-            WHERE symbol=? AND exchange=?
-            """,
+            "SELECT published FROM news_items WHERE symbol=? AND exchange=?",
             con,
             params=(symbol, exchange),
         )
-
     if df.empty:
         return 0, 0, 999
-
     df["published"] = pd.to_datetime(df["published"], errors="coerce").dt.date
     df = df.dropna(subset=["published"])
     if df.empty:
         return 0, 0, 999
-
     m5 = int((today - df["published"] <= dt.timedelta(days=5)).sum())
     m60 = int((today - df["published"] <= dt.timedelta(days=60)).sum())
     last = df["published"].max()
@@ -330,9 +253,8 @@ def rss_counts(symbol: str, exchange: str):
 
 
 def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
-    baseline = max(1.0, m60 / 12.0)  # 60 days => 12 buckets of 5 days
+    baseline = max(1.0, m60 / 12.0)
     intensity_ratio = m5 / baseline
-
     intensity_pts = (intensity_ratio - 0.5) * 30.0
     intensity_pts = float(max(0.0, min(60.0, intensity_pts)))
 
@@ -352,8 +274,6 @@ def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
 
 
 def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.DataFrame:
-    symbol = str(symbol).strip().upper()
-    exchange = str(exchange).strip().upper()
     with db() as con:
         return pd.read_sql_query(
             """
@@ -368,7 +288,6 @@ def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.Data
         )
 
 
-# --------- Metrics (safe) ---------
 def compute_metrics(df: pd.DataFrame) -> dict:
     out = {
         "live": np.nan,
@@ -386,17 +305,13 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     if "close" not in df.columns:
         return out
 
-    close_col = df["close"]
-    if isinstance(close_col, pd.DataFrame):
-        close = close_col.iloc[:, 0]
-    else:
-        close = close_col
-    if not isinstance(close, pd.Series) or close.dropna().empty:
+    close = df["close"]
+    if close.dropna().empty:
         return out
 
     d = df.copy()
     d["date_dt"] = pd.to_datetime(d["date"], errors="coerce")
-    d["close_"] = pd.to_numeric(close, errors="coerce")
+    d["close_"] = pd.to_numeric(d["close"], errors="coerce")
     d = d.dropna(subset=["date_dt", "close_"]).sort_values("date_dt")
     if d.empty:
         return out
@@ -460,7 +375,6 @@ def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
     return pd.concat([take2, rest], axis=0, ignore_index=True)
 
 
-# ---------------- Refresh (RSS Score) ----------------
 def refresh_one_stock(symbol: str, exchange: str, name: str):
     symbol = str(symbol).strip().upper()
     exchange = str(exchange).strip().upper()
@@ -484,16 +398,21 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
     m5, m60, recency_days = rss_counts(symbol, exchange)
     nscore = news_score_from_rss(m5, m60, recency_days)
 
+    # Indicator from DB prices (daily)
+    dbpx = get_prices_from_db(symbol, exchange)
+    feats = indicator_features(dbpx)
+    iscore, ibreak = indicator_score(feats)
+    cscore = combined_score(iscore, nscore, 0.8, 0.2)
+
     reasons = {
-        "source": "Google News RSS",
-        "fetched_items_this_refresh": fetched,
-        "mentions_5d": m5,
-        "mentions_60d": m60,
-        "recency_days": recency_days,
-        "news_score": nscore,
+        "source": "Manual refresh",
+        "rss": {"fetched": fetched, "m5": m5, "m60": m60, "recency_days": recency_days, "news_score": nscore},
+        "indicator": ibreak,
+        "combined": {"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind": 0.8, "w_news": 0.2},
     }
-    upsert_signal(symbol, exchange, asof, nscore, json.dumps(reasons))
-    return {"ok": True, "news_score": nscore, "fetched": fetched}
+    # Store combined score into signals.score
+    upsert_signal(symbol, exchange, asof, cscore, reasons)
+    return {"ok": True, "news_score": nscore, "indicator_score": iscore, "combined_score": cscore, "fetched": fetched}
 
 
 # ---------------- Debug panel ----------------
@@ -549,7 +468,9 @@ if page == "Discover & Add":
         show["score"] = 0
     show["score"] = show["score"].fillna(0).astype(int)
 
+    show = show.rename(columns={"score": "combined_score"})
     show.insert(0, "add", False)
+
     show = enrich_with_metrics(show, max_rows=30)
 
     add_btn = st.button("➕ Add selected to Watchlist", use_container_width=True)
@@ -562,7 +483,7 @@ if page == "Discover & Add":
                 "symbol",
                 "name",
                 "sector",
-                "score",
+                "combined_score",
                 "live",
                 "52w_high",
                 "52w_low",
@@ -579,7 +500,7 @@ if page == "Discover & Add":
         hide_index=True,
         column_config={
             "add": st.column_config.CheckboxColumn("Add"),
-            "score": st.column_config.NumberColumn("NewsScore", format="%d"),
+            "combined_score": st.column_config.NumberColumn("CombinedScore", format="%d"),
             "live": st.column_config.NumberColumn("Live", format="%.2f"),
             "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
             "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
@@ -625,15 +546,17 @@ elif page == "Watchlist":
         df["asof"] = None
 
     df["score"] = df["score"].fillna(0).astype(int)
+    df = df.rename(columns={"score": "combined_score"})
+
     df = enrich_with_metrics(df, max_rows=30)
-    df = df.sort_values(["score"], ascending=False).copy()
+    df = df.sort_values(["combined_score"], ascending=False).copy()
     df.insert(0, "delete", False)
 
     c1, c2 = st.columns([2, 4])
     with c1:
         del_btn = st.button("🗑️ Delete selected", use_container_width=True)
     with c2:
-        st.caption("Use Story panel refresh to update RSS NewsScore + prices.")
+        st.caption("Refresh from Story panel to update CombinedScore (Indicators+RSS).")
 
     edited = st.data_editor(
         df[
@@ -643,7 +566,7 @@ elif page == "Watchlist":
                 "symbol",
                 "name",
                 "sector",
-                "score",
+                "combined_score",
                 "live",
                 "52w_high",
                 "52w_low",
@@ -660,7 +583,7 @@ elif page == "Watchlist":
         hide_index=True,
         column_config={
             "delete": st.column_config.CheckboxColumn("Del"),
-            "score": st.column_config.NumberColumn("NewsScore", format="%d"),
+            "combined_score": st.column_config.NumberColumn("CombinedScore", format="%d"),
             "live": st.column_config.NumberColumn("Live", format="%.2f"),
             "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
             "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
@@ -690,15 +613,17 @@ elif page == "Watchlist":
 
     row = df[(df.symbol == sel_sym) & (df.exchange == sel_ex)].iloc[0]
     st.markdown(f"### **{row['name']}** — {sel_sym} ({sel_ex})")
+    st.caption("CombinedScore = 80% IndicatorScore + 20% NewsScore (RSS).")
 
-    if st.button("🔄 Refresh this stock now (RSS + prices)", use_container_width=True):
+    if st.button("🔄 Refresh this stock now (Indicators + RSS + prices)", use_container_width=True):
         res = refresh_one_stock(sel_sym, sel_ex, row["name"])
-        st.success(f"Refreshed. NewsScore={res.get('news_score')}  (fetched={res.get('fetched')})")
+        st.success(
+            f"Refreshed. Indicator={res.get('indicator_score')}  News={res.get('news_score')}  Combined={res.get('combined_score')}"
+        )
         st.rerun()
 
-    # -------- GROUPED RSS HEADLINES (DATE-WISE) --------
+    # Grouped RSS headlines
     st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
-
     h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
     if h is None or h.empty:
         st.info("No RSS headlines stored yet. Click refresh once.")
@@ -706,21 +631,16 @@ elif page == "Watchlist":
         h = h.copy()
         h["published"] = pd.to_datetime(h["published"], errors="coerce").dt.date
         h = h.dropna(subset=["published"])
-
         if h.empty:
             st.info("No valid-dated headlines available.")
         else:
-            # De-duplicate titles per date (case-insensitive)
             h["_t"] = h["title"].astype(str).str.strip().str.lower()
             h = h.drop_duplicates(subset=["published", "_t"]).drop(columns=["_t"])
-
             latest_date = h["published"].max()
             unique_dates = sorted(h["published"].unique(), reverse=True)
-
             for pub_date in unique_dates:
                 day_items = h[h["published"] == pub_date].copy()
                 day_items = day_items.sort_values(["source", "title"], ascending=[True, True])
-
                 with st.expander(
                     f"📅 {pub_date} — {len(day_items)} headlines",
                     expanded=(pub_date == latest_date),
