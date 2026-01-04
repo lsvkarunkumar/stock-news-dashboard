@@ -1,21 +1,21 @@
-name: Update Data
+name: Update data
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"
   workflow_dispatch:
-
-permissions:
-  contents: write
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -26,13 +26,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run updater
+        env:
+          TZ: Africa/Lagos
         run: |
-          python scripts/update_data.py
+          python -m scripts.update_data
 
-      - name: Commit updated DB
+      - name: Commit DB changes
         run: |
           git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add data/app.db
-          git commit -m "Auto अपडेट: data refresh" || echo "No changes"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "Auto update data" || echo "No changes to commit"
           git push
