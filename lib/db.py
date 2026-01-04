@@ -1,9 +1,7 @@
-import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-# Always store DB inside repo so GitHub Actions + Streamlit read the SAME file
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -12,8 +10,10 @@ DB_PATH = str(DATA_DIR / "stock.db")
 
 def init_db():
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.execute("PRAGMA synchronous=NORMAL;")
+        # IMPORTANT for GitHub Actions + committing DB:
+        # Use single-file journal so all changes are in stock.db (no -wal, no -shm)
+        con.execute("PRAGMA journal_mode=DELETE;")
+        con.execute("PRAGMA synchronous=FULL;")
 
         con.execute("""
         CREATE TABLE IF NOT EXISTS universe(
@@ -89,7 +89,6 @@ def init_db():
         )
         """)
 
-        # ensure wallet row exists
         cur = con.execute("SELECT COUNT(*) FROM paper_wallet WHERE id=1")
         if cur.fetchone()[0] == 0:
             con.execute("INSERT INTO paper_wallet(id, cash) VALUES(1, ?)", (100000.0,))
