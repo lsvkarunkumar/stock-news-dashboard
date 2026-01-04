@@ -42,21 +42,28 @@ jobs:
           find . -type f -name "*.db-wal" -delete
           find . -type f -name "*.db-shm" -delete
 
-      - name: Commit & push (rebase-safe)
+      - name: Commit & push (stash + rebase safe)
         run: |
+          set -e
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          # Always integrate latest remote main first
+          # Stash any changes created by updater (e.g., data/stock.db)
+          git add -A
+          git stash push -m "ci-stash" || true
+
+          # Rebase onto latest main
           git fetch origin main
           git rebase origin/main || (git rebase --abort && git pull --rebase origin main)
 
-          # Only commit DB + watchlist file (keeps repo clean)
+          # Re-apply stashed changes
+          git stash pop || true
+
+          # Stage only what we want to commit
           git add data/stock.db data/watchlist.csv || true
 
           git status
 
           git commit -m "Auto update data" || echo "No changes to commit"
 
-          # Push after rebase
           git push origin HEAD:main
