@@ -1,78 +1,94 @@
-import datetime as dt
-from urllib.parse import quote_plus
-
+import re
 import feedparser
+from datetime import date, timedelta
 
+NEG_WORDS = {
+    "loss","decline","falls","fall","down","plunge","crash","slump","weak","worst",
+    "penalty","fine","fraud","scam","probe","raids","raid","ed","sebi","cbi",
+    "lawsuit","case","ban","halt","suspend","default","bankrupt","bankruptcy",
+    "debt","demand","notice","tax","gst","agr","downgrade","cut","cuts","resign",
+    "warning","negative","selloff","sell-off","bearish","miss","misses"
+}
 
-def _google_news_rss_url(query: str) -> str:
-    q = quote_plus(query)
-    return f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+POS_WORDS = {
+    "gain","gains","up","surge","jump","rally","beats","beat","record","strong",
+    "profit","growth","approval","cleared","order","contract","wins","win",
+    "upgrade","buy","bullish","recovery","turnaround","investment","funding",
+    "relief","package","deal","partnership","launch","expansion"
+}
 
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def build_rss_query(company_name: str, symbol: str | None = None) -> str:
-    name = (company_name or "").strip()
-    sym = (symbol or "").strip().upper()
-    if name and sym:
-        return f'"{name}" OR "{sym}"'
-    if name:
-        return f'"{name}"'
-    if sym:
-        return f'"{sym}"'
-    return ""
+def headline_sentiment(title: str) -> dict:
+    t = _norm(title)
+    if not t:
+        return {"label": "neutral", "score": 0}
 
+    toks = set(t.split(" "))
+    neg = len([w for w in NEG_WORDS if w in toks or w in t])
+    pos = len([w for w in POS_WORDS if w in toks or w in t])
 
-def fetch_google_news_rss(company_name: str, symbol: str, days: int = 60) -> list[dict]:
-    query = build_rss_query(company_name, symbol)
-    if not query:
+    raw = pos - neg
+    if raw >= 2:
+        return {"label": "positive", "score": min(5, raw)}
+    if raw <= -2:
+        return {"label": "negative", "score": max(-5, raw)}
+    return {"label": "neutral", "score": raw}
+
+def fetch_google_news_rss(company_name: str, symbol: str, days: int = 60):
+    """
+    Pull Google News RSS for India. Free, no key.
+    Returns list of dict: published, title, url, source, sentiment_label, sentiment_score
+    """
+    q = company_name if company_name else symbol
+    q = q.strip()
+    if not q:
         return []
 
-    url = _google_news_rss_url(query)
+    # Google News RSS query
+    # hl=en-IN gl=IN ceid=IN:en gives India edition
+    url = f"https://news.google.com/rss/search?q={q}+stock+OR+{symbol}&hl=en-IN&gl=IN&ceid=IN:en"
+
     feed = feedparser.parse(url)
+    out = []
+    cutoff = date.today() - timedelta(days=days)
 
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
-    items: list[dict] = []
+    for e in feed.entries[:200]:
+        title = getattr(e, "title", "") or ""
+        link = getattr(e, "link", "") or ""
+        published = getattr(e, "published", "") or getattr(e, "updated", "") or ""
 
-    for e in getattr(feed, "entries", []) or []:
-        published_dt = None
-        if hasattr(e, "published_parsed") and e.published_parsed:
-            try:
-                published_dt = dt.datetime(*e.published_parsed[:6])
-            except Exception:
-                published_dt = None
-        if published_dt is None:
-            published_dt = dt.datetime.utcnow()
-
-        if published_dt < cutoff:
-            continue
-
-        title = (getattr(e, "title", "") or "").strip()
-        link = (getattr(e, "link", "") or "").strip()
-
-        src = "Google News"
+        # best-effort date parse
         try:
-            if hasattr(e, "source") and isinstance(e.source, dict):
-                src = e.source.get("title", src) or src
-            elif hasattr(e, "source") and hasattr(e.source, "title"):
-                src = e.source.title or src
+            pd = feedparser._parse_date(published)
+            if pd:
+                pub_date = date(pd.tm_year, pd.tm_mon, pd.tm_mday)
+            else:
+                pub_date = date.today()
         except Exception:
-            pass
+            pub_date = date.today()
 
-        if title:
-            items.append({
-                "published": published_dt.date().isoformat(),
-                "title": title,
-                "url": link,
-                "source": str(src).strip() if src else "Google News"
-            })
-
-    # Deduplicate within fetch
-    seen = set()
-    uniq = []
-    for it in items:
-        k = (it["published"], it["title"])
-        if k in seen:
+        if pub_date < cutoff:
             continue
-        seen.add(k)
-        uniq.append(it)
 
-    return uniq
+        source = ""
+        try:
+            source = e.get("source", {}).get("title", "")
+        except Exception:
+            source = ""
+
+        sent = headline_sentiment(title)
+        out.append({
+            "published": str(pub_date),
+            "title": title,
+            "url": link,
+            "source": source or "Google News",
+            "sentiment_label": sent["label"],
+            "sentiment_score": int(sent["score"]),
+        })
+
+    return out
