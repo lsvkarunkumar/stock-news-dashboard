@@ -1,20 +1,24 @@
-import datetime as dt
-import pandas as pd
-import yfinance as yf
-
 def to_yahoo_ticker(symbol: str, exchange: str) -> str:
-    if exchange == "NSE":
-        return f"{symbol}.NS"
-    if exchange == "BSE":
-        return f"{symbol}.BO"
-    return symbol
+    """
+    Convert NSE/BSE symbol to Yahoo Finance ticker.
+    NSE -> .NS
+    BSE -> .BO
 
-def fetch_prices(symbol: str, exchange: str, period_days: int = 365) -> pd.DataFrame:
-    t = to_yahoo_ticker(symbol, exchange)
-    df = yf.download(t, period=f"{period_days}d", interval="1d", progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-    df = df.reset_index()
-    df["date"] = pd.to_datetime(df["Date"]).dt.date.astype(str)
-    df = df.rename(columns={"Close": "close", "Volume": "volume"})
-    return df[["date", "close", "volume"]]
+    Handles common exchange labels from different universe sources.
+    """
+    sym = (symbol or "").strip().upper()
+    ex = (exchange or "").strip().upper()
+
+    # If already a Yahoo-style ticker, return as-is
+    if sym.endswith(".NS") or sym.endswith(".BO"):
+        return sym
+
+    # Normalize exchange
+    # Many sources use NSE/BSE, sometimes NSEEQ, BSEEQ, "NSE" with extra text.
+    if "NSE" in ex or ex in {"NS"}:
+        return f"{sym}.NS"
+    if "BSE" in ex or ex in {"BO"}:
+        return f"{sym}.BO"
+
+    # Fallback: assume NSE if unknown (best default for India watchlists)
+    return f"{sym}.NS"
