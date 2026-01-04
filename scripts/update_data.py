@@ -31,6 +31,17 @@ def _flatten(df):
     return df
 
 
+def load_watchlist_csv():
+    if not WATCHLIST_CSV.exists():
+        return pd.DataFrame(columns=["symbol", "exchange"])
+    df = pd.read_csv(WATCHLIST_CSV)
+    if df.empty:
+        return df
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["exchange"] = df["exchange"].astype(str).str.strip().str.upper()
+    return df.drop_duplicates(subset=["symbol", "exchange"])
+
+
 def yf_daily(symbol, exchange):
     t = to_yahoo_ticker(symbol, exchange)
     raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
@@ -53,7 +64,6 @@ def yf_daily(symbol, exchange):
 
     df["close"] = pd.to_numeric(close_s, errors="coerce")
     df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else None
-
     out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
     return out, {"ticker": t, "rows": int(len(out))}
 
@@ -69,7 +79,10 @@ def upsert_prices(symbol, exchange, df):
     if not rows:
         return 0
     with db() as con:
-        con.executemany("INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume) VALUES (?,?,?,?,?)", rows)
+        con.executemany(
+            "INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume) VALUES (?,?,?,?,?)",
+            rows,
+        )
         con.commit()
     return len(rows)
 
@@ -96,22 +109,11 @@ def upsert_signal(symbol, exchange, asof, score, reasons):
         con.commit()
 
 
-def load_watchlist():
-    if not WATCHLIST_CSV.exists():
-        return pd.DataFrame(columns=["symbol", "exchange"])
-    df = pd.read_csv(WATCHLIST_CSV)
-    if df.empty:
-        return df
-    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-    df["exchange"] = df["exchange"].astype(str).str.strip().str.upper()
-    return df.drop_duplicates(subset=["symbol","exchange"])
-
-
 def main():
     init_db()
     asof = date.today().isoformat()
-    wl = load_watchlist()
 
+    wl = load_watchlist_csv()
     print("DB_PATH =", DB_PATH)
     print("watchlist.csv rows =", len(wl))
 
@@ -119,14 +121,14 @@ def main():
         print("No watchlist stocks. Nothing to update.")
         return
 
-    # enrich names from universe if available
+    # get names from universe if present
     with db() as con:
         uni = pd.read_sql_query("SELECT symbol, exchange, name FROM universe", con)
 
-    wl2 = wl.merge(uni, on=["symbol","exchange"], how="left")
-    wl2["name"] = wl2["name"].fillna(wl2["symbol"])
+    wl = wl.merge(uni, on=["symbol", "exchange"], how="left")
+    wl["name"] = wl["name"].fillna(wl["symbol"])
 
-    for r in wl2.itertuples(index=False):
+    for r in wl.itertuples(index=False):
         symbol, exchange, name = r.symbol, r.exchange, str(r.name)
 
         px, meta = yf_daily(symbol, exchange)
@@ -143,16 +145,16 @@ def main():
         feats = indicator_features(dbpx)
         iscore, ibreak = indicator_score(feats)
 
-        # temporary: keep news score 0 here (we’ll add sentiment next after prices flow)
+        # keep news=0 for now; after prices fixed we’ll add sentiment+red/green
         nscore = 0
         cscore = combined_score(iscore, nscore, 0.8, 0.2)
 
         reasons = {
-            "source":"Daily update (Actions)",
-            "prices":{"yahoo_ticker": meta["ticker"], "rows_fetched": meta["rows"], "rows_inserted": ins_px, "rows_db": int(len(dbpx))},
-            "rss":{"rows_inserted": ins_news},
+            "source": "Daily update (Actions)",
+            "scores": {"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind": 0.8, "w_news": 0.2},
+            "prices": {"yahoo_ticker": meta["ticker"], "rows_fetched": meta["rows"], "rows_inserted": ins_px, "rows_db": int(len(dbpx))},
+            "rss": {"rows_inserted": ins_news},
             "indicator": ibreak,
-            "scores":{"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind":0.8, "w_news":0.2},
         }
         upsert_signal(symbol, exchange, asof, cscore, reasons)
         print(symbol, exchange, "yf_rows", meta["rows"], "ins_px", ins_px, "db_px", len(dbpx), "news_ins", ins_news)
