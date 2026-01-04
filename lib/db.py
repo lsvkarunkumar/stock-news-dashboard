@@ -1,44 +1,33 @@
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path("data") / "app.db"
+# Always store DB inside repo so GitHub Actions + Streamlit read the SAME file
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
-
-def _ensure_paths():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
-@contextmanager
-def db():
-    _ensure_paths()
-    con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    try:
-        yield con
-    finally:
-        con.close()
-
+DB_PATH = str(DATA_DIR / "stock.db")
 
 def init_db():
-    _ensure_paths()
-    with db() as con:
-        cur = con.cursor()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
 
-        # Universe
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS universe (
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS universe(
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
             name TEXT,
-            isin TEXT,
             sector TEXT,
+            isin TEXT,
             PRIMARY KEY(symbol, exchange)
         )
         """)
 
-        # Watchlist
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist (
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist(
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
             added_at TEXT,
@@ -46,9 +35,8 @@ def init_db():
         )
         """)
 
-        # Prices
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS prices (
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS prices(
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
             date TEXT NOT NULL,
@@ -58,22 +46,20 @@ def init_db():
         )
         """)
 
-        # RSS News items (raw headlines)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS news_items (
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS news_items(
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
             published TEXT,
             title TEXT,
             url TEXT,
             source TEXT,
-            PRIMARY KEY(symbol, exchange, published, title)
+            UNIQUE(symbol, exchange, published, title)
         )
         """)
 
-        # Signals (Score snapshots)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS signals(
             symbol TEXT NOT NULL,
             exchange TEXT NOT NULL,
             asof TEXT NOT NULL,
@@ -83,30 +69,36 @@ def init_db():
         )
         """)
 
-        # Paper trading (single wallet for now; we’ll split Auto/Manual next step)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS paper_wallet (
-            id INTEGER PRIMARY KEY,
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS paper_wallet(
+            id INTEGER PRIMARY KEY CHECK (id=1),
             cash REAL
         )
         """)
-        cur.execute("INSERT OR IGNORE INTO paper_wallet(id, cash) VALUES (1, 1000000)")
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS paper_trades (
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT,
             symbol TEXT,
             exchange TEXT,
             side TEXT,
             qty REAL,
             price REAL,
-            notes TEXT
+            note TEXT
         )
         """)
 
-        # Indexes
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_prices_symex ON prices(symbol, exchange)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_items_symex ON news_items(symbol, exchange)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symex ON signals(symbol, exchange)")
-
+        # ensure wallet row exists
+        cur = con.execute("SELECT COUNT(*) FROM paper_wallet WHERE id=1")
+        if cur.fetchone()[0] == 0:
+            con.execute("INSERT INTO paper_wallet(id, cash) VALUES(1, ?)", (100000.0,))
         con.commit()
+
+@contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH)
+    try:
+        yield con
+    finally:
+        con.close()
