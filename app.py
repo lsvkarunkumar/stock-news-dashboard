@@ -1,22 +1,13 @@
 import json
-import math
-import datetime as dt
-from datetime import date
-
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
+from datetime import date
 
-from lib.db import init_db, db, DB_PATH
+from lib.db import init_db, db
 from lib.universe import get_universe, fetch_universe, upsert_universe
-from lib.prices import to_yahoo_ticker
-from lib.news_rss import fetch_google_news_rss
-from lib.scoring import indicator_features, indicator_score, combined_score
 
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
-
 
 def load_css():
     try:
@@ -25,748 +16,245 @@ def load_css():
     except Exception:
         pass
 
-
 init_db()
 load_css()
 
-st.title("🧠 News × Price Dashboard")
-st.caption("Auto-updated watchlist with price context + RSS news (educational). Final decision is yours.")
+st.title("🧠 News × Price Watchlist (Auto-updated)")
+st.caption("Educational dashboard. Final investment decision is always yours.")
 
+# Sidebar
 with st.sidebar:
     st.header("Controls")
     page = st.radio("Go to", ["Discover & Add", "Watchlist", "Paper Trading"], index=0)
     st.divider()
-    debug_on = st.toggle("Debug mode", value=False)
+    st.caption("Tip: If you just ran GitHub Actions, use Streamlit 'Reboot app' if data doesn't appear.")
 
-
-def is_valid_url(x):
-    if x is None:
-        return False
-    if isinstance(x, float) and math.isnan(x):
-        return False
-    if not isinstance(x, str):
-        return False
-    x = x.strip()
-    return x.startswith("http://") or x.startswith("https://")
-
-
-def ensure_universe_loaded():
-    uni = get_universe()
-    if len(uni) > 0:
-        return uni, False
-    fresh = fetch_universe()
-    upsert_universe(fresh)
-    return get_universe(), True
-
-
-def normalize_df(rows: pd.DataFrame) -> pd.DataFrame:
-    clean = rows.copy()
-    clean["symbol"] = clean["symbol"].astype(str).str.strip().str.upper()
-    clean["exchange"] = clean["exchange"].astype(str).str.strip().str.upper()
-    return clean.drop_duplicates(subset=["symbol", "exchange"])
-
-
-def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            tickers = list(dict.fromkeys([c[1] for c in df.columns if len(c) > 1]))
-            if tickers:
-                df = df.xs(tickers[0], axis=1, level=1, drop_level=True)
-        except Exception:
-            pass
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] if isinstance(c, tuple) and len(c) > 0 else str(c) for c in df.columns]
-    df = df.copy()
-    df.columns = [str(c) for c in df.columns]
-    return df
-
-
-def _series_col(df: pd.DataFrame, name_candidates):
-    for nm in name_candidates:
-        if nm in df.columns:
-            col = df[nm]
-            if isinstance(col, pd.DataFrame):
-                return col.iloc[:, 0]
-            return col
-    return None
-
-
-def _extract_scores_from_reasons(reasons_val):
-    """
-    reasons_val is JSON string or dict.
-    returns (indicator, news, combined)
-    """
-    ind = 0
-    news = 0
-    comb = 0
-    try:
-        if reasons_val is None or (isinstance(reasons_val, float) and math.isnan(reasons_val)):
-            return ind, news, comb
-        obj = reasons_val
-        if isinstance(reasons_val, str):
-            obj = json.loads(reasons_val)
-        scores = obj.get("scores", {})
-        ind = int(scores.get("indicator_score", 0) or 0)
-        news = int(scores.get("news_score", 0) or 0)
-        comb = int(scores.get("combined_score", 0) or 0)
-    except Exception:
-        pass
-    return ind, news, comb
-
-
-# ---------------- DB ops ----------------
+# Helpers
 def add_to_watchlist_bulk(rows: pd.DataFrame):
-    if rows is None or rows.empty:
+    if rows.empty:
         return
-    clean = normalize_df(rows)
     with db() as con:
         con.executemany(
             "INSERT OR IGNORE INTO watchlist(symbol, exchange, added_at) VALUES (?,?,?)",
-            [(r.symbol, r.exchange, date.today().isoformat()) for r in clean.itertuples(index=False)],
+            [(r.symbol, r.exchange, date.today().isoformat()) for r in rows.itertuples(index=False)]
         )
         con.commit()
 
-
-def remove_from_watchlist_bulk(rows: pd.DataFrame):
-    if rows is None or rows.empty:
-        return
-    clean = normalize_df(rows)
+def remove_from_watchlist(symbol: str, exchange: str):
     with db() as con:
-        con.executemany(
-            "DELETE FROM watchlist WHERE symbol=? AND exchange=?",
-            [(r.symbol, r.exchange) for r in clean.itertuples(index=False)],
-        )
+        con.execute("DELETE FROM watchlist WHERE symbol=? AND exchange=?", (symbol, exchange))
         con.commit()
-
 
 def get_watchlist_df():
     with db() as con:
-        return pd.read_sql_query(
-            """
-            SELECT w.symbol, w.exchange, u.name, COALESCE(u.sector,'Unknown') AS sector, COALESCE(u.isin,'') AS isin, w.added_at
+        return pd.read_sql_query("""
+            SELECT w.symbol, w.exchange, u.name, w.added_at
             FROM watchlist w
             LEFT JOIN universe u ON u.symbol=w.symbol AND u.exchange=w.exchange
             ORDER BY w.added_at DESC
-            """,
-            con,
-        )
+        """, con)
 
-
-def latest_signals_per_stock():
+def get_latest_signals():
     with db() as con:
-        return pd.read_sql_query(
-            """
-            SELECT s.*
+        return pd.read_sql_query("""
+            SELECT s.symbol, s.exchange, s.asof, s.score, s.reasons, u.name
             FROM signals s
-            JOIN (
-                SELECT symbol, exchange, MAX(asof) AS max_asof
-                FROM signals
-                GROUP BY symbol, exchange
-            ) t
-            ON s.symbol=t.symbol AND s.exchange=t.exchange AND s.asof=t.max_asof
-            """,
-            con,
-        )
+            LEFT JOIN universe u ON u.symbol=s.symbol AND u.exchange=s.exchange
+            WHERE s.asof = (SELECT MAX(asof) FROM signals)
+        """, con)
 
-
-def upsert_signal(symbol, exchange, asof, combined_val, reasons):
+def get_latest_mentions():
     with db() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO signals(symbol, exchange, asof, score, reasons) VALUES (?,?,?,?,?)",
-            (symbol, exchange, asof, int(combined_val), json.dumps(reasons)),
-        )
-        con.commit()
+        return pd.read_sql_query("""
+            SELECT n.symbol, n.exchange, n.date, n.mentions, n.sample_headline, n.sample_url, u.name
+            FROM news_mentions n
+            LEFT JOIN universe u ON u.symbol=n.symbol AND u.exchange=n.exchange
+            WHERE n.date = (SELECT MAX(date) FROM news_mentions)
+        """, con)
 
-
-def get_prices_from_db(symbol, exchange):
+def get_prices(symbol, exchange):
     with db() as con:
-        return pd.read_sql_query(
-            "SELECT date, close, volume FROM prices WHERE symbol=? AND exchange=? ORDER BY date",
-            con,
-            params=(symbol, exchange),
-        )
-
-
-# ---------------- Market data (safe) ----------------
-def yf_history_force(symbol: str, exchange: str) -> pd.DataFrame:
-    t = to_yahoo_ticker(symbol, exchange)
-
-    # Intraday first
-    try:
-        raw = yf.download(t, period="1d", interval="1m", progress=False, threads=True, auto_adjust=False)
-        if raw is not None and not raw.empty:
-            df = raw.reset_index()
-            df = _flatten_yf_columns(df)
-
-            dt_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
-            df["date"] = pd.to_datetime(df[dt_col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-
-            close_s = _series_col(df, ["Close", "close"])
-            vol_s = _series_col(df, ["Volume", "volume"])
-            if close_s is None:
-                return pd.DataFrame(columns=["date", "close", "volume"])
-
-            df["close"] = pd.to_numeric(close_s, errors="coerce")
-            df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
-            return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-    except Exception:
-        pass
-
-    # Daily fallback
-    try:
-        raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
-        if raw is None or raw.empty:
-            return pd.DataFrame(columns=["date", "close", "volume"])
-
-        df = raw.reset_index()
-        df = _flatten_yf_columns(df)
-
-        dcol = "Date" if "Date" in df.columns else df.columns[0]
-        df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
-
-        close_s = _series_col(df, ["Close", "close"])
-        vol_s = _series_col(df, ["Volume", "volume"])
-        if close_s is None:
-            return pd.DataFrame(columns=["date", "close", "volume"])
-
-        df["close"] = pd.to_numeric(close_s, errors="coerce")
-        df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
-        return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-    except Exception:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-
-
-@st.cache_data(ttl=5 * 60, show_spinner=False)
-def yf_history_cached_daily(symbol: str, exchange: str) -> pd.DataFrame:
-    t = to_yahoo_ticker(symbol, exchange)
-    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
-    if raw is None or raw.empty:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-
-    df = raw.reset_index()
-    df = _flatten_yf_columns(df)
-
-    dcol = "Date" if "Date" in df.columns else df.columns[0]
-    df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
-
-    close_s = _series_col(df, ["Close", "close"])
-    vol_s = _series_col(df, ["Volume", "volume"])
-    if close_s is None:
-        return pd.DataFrame(columns=["date", "close", "volume"])
-
-    df["close"] = pd.to_numeric(close_s, errors="coerce")
-    df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else np.nan
-    return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
-
-
-def upsert_prices(symbol, exchange, df):
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return
-    if "date" not in df.columns or "close" not in df.columns:
-        return
-
-    rows = []
-    for _, r in df.iterrows():
-        d = r.get("date")
-        c = r.get("close")
-        v = r.get("volume", None)
-        if pd.isna(d) or pd.isna(c):
-            continue
-        rows.append((symbol, exchange, str(d), float(c), float(v) if pd.notna(v) else None))
-
-    if not rows:
-        return
-
-    with db() as con:
-        con.executemany(
-            "INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume) VALUES (?,?,?,?,?)",
-            rows,
-        )
-        con.commit()
-
-
-# ---------------- RSS news -> DB ----------------
-def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int = 60) -> int:
-    items = fetch_google_news_rss(company_name, symbol, days=days)
-    if not items:
-        return 0
-    with db() as con:
-        con.executemany(
-            """
-            INSERT OR IGNORE INTO news_items(symbol, exchange, published, title, url, source)
-            VALUES (?,?,?,?,?,?)
-            """,
-            [(symbol, exchange, it["published"], it["title"], it["url"], it["source"]) for it in items],
-        )
-        con.commit()
-    return len(items)
-
-
-def rss_counts(symbol: str, exchange: str):
-    today = dt.date.today()
-    with db() as con:
-        df = pd.read_sql_query(
-            "SELECT published FROM news_items WHERE symbol=? AND exchange=?",
-            con,
-            params=(symbol, exchange),
-        )
-    if df.empty:
-        return 0, 0, 999
-    df["published"] = pd.to_datetime(df["published"], errors="coerce").dt.date
-    df = df.dropna(subset=["published"])
-    if df.empty:
-        return 0, 0, 999
-    m5 = int((today - df["published"] <= dt.timedelta(days=5)).sum())
-    m60 = int((today - df["published"] <= dt.timedelta(days=60)).sum())
-    last = df["published"].max()
-    recency_days = (today - last).days if last else 999
-    return m5, m60, recency_days
-
-
-def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
-    baseline = max(1.0, m60 / 12.0)
-    intensity_ratio = m5 / baseline
-    intensity_pts = (intensity_ratio - 0.5) * 30.0
-    intensity_pts = float(max(0.0, min(60.0, intensity_pts)))
-
-    if recency_days <= 2:
-        recency_pts = 40
-    elif recency_days <= 5:
-        recency_pts = 30
-    elif recency_days <= 10:
-        recency_pts = 20
-    elif recency_days <= 20:
-        recency_pts = 10
-    else:
-        recency_pts = 0
-
-    score = int(round(min(100.0, intensity_pts + recency_pts)))
-    return max(0, min(100, score))
-
-
-def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.DataFrame:
-    with db() as con:
-        return pd.read_sql_query(
-            """
-            SELECT published, title, url, source
-            FROM news_items
+        return pd.read_sql_query("""
+            SELECT date, close, volume
+            FROM prices
             WHERE symbol=? AND exchange=?
-            ORDER BY published DESC
-            LIMIT ?
-            """,
-            con,
-            params=(symbol, exchange, int(limit)),
-        )
+            ORDER BY date
+        """, con, params=(symbol, exchange))
 
+def ensure_universe_loaded():
+    """If universe table is empty in this Streamlit runtime, load it once."""
+    uni = get_universe()
+    if len(uni) > 0:
+        return uni, False
 
-# --------- Metrics ---------
-def compute_metrics(df: pd.DataFrame) -> dict:
-    out = {
-        "live": np.nan,
-        "52w_high": np.nan,
-        "52w_low": np.nan,
-        "ret_1d": np.nan,
-        "ret_1w": np.nan,
-        "ret_1m": np.nan,
-        "ret_3m": np.nan,
-        "ret_6m": np.nan,
-        "ret_12m": np.nan,
-    }
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return out
-    if "close" not in df.columns:
-        return out
-
-    close = pd.to_numeric(df["close"], errors="coerce")
-    if close.dropna().empty:
-        return out
-
-    d = df.copy()
-    d["date_dt"] = pd.to_datetime(d["date"], errors="coerce")
-    d["close_"] = close
-    d = d.dropna(subset=["date_dt", "close_"]).sort_values("date_dt")
-    if d.empty:
-        return out
-
-    last_close = float(d["close_"].iloc[-1])
-    out["live"] = last_close
-
-    cutoff = d["date_dt"].iloc[-1] - pd.Timedelta(days=365)
-    d52 = d[d["date_dt"] >= cutoff]
-    if not d52.empty:
-        out["52w_high"] = float(d52["close_"].max())
-        out["52w_low"] = float(d52["close_"].min())
-
-    last_dt = d["date_dt"].iloc[-1]
-
-    def ret(days):
-        target = last_dt - pd.Timedelta(days=days)
-        base_rows = d[d["date_dt"] <= target]
-        if base_rows.empty:
-            return np.nan
-        base = float(base_rows["close_"].iloc[-1])
-        if base == 0:
-            return np.nan
-        return (last_close / base - 1.0) * 100.0
-
-    out["ret_1d"] = ret(1)
-    out["ret_1w"] = ret(7)
-    out["ret_1m"] = ret(30)
-    out["ret_3m"] = ret(90)
-    out["ret_6m"] = ret(180)
-    out["ret_12m"] = ret(365)
-    return out
-
-
-def enrich_with_metrics(df: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    take = df.head(max_rows).copy()
-    metrics = []
-    for r in take.itertuples(index=False):
-        try:
-            h = yf_history_cached_daily(r.symbol, r.exchange)
-            metrics.append(compute_metrics(h))
-        except Exception:
-            metrics.append({k: np.nan for k in ["live","52w_high","52w_low","ret_1d","ret_1w","ret_1m","ret_3m","ret_6m","ret_12m"]})
-    met = pd.DataFrame(metrics)
-    take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
-    rest = df.iloc[max_rows:].copy()
-    return pd.concat([take2, rest], axis=0, ignore_index=True)
-
-
-# ---------------- Refresh (Indicators + RSS) ----------------
-def refresh_one_stock(symbol: str, exchange: str, name: str):
-    symbol = str(symbol).strip().upper()
-    exchange = str(exchange).strip().upper()
-    name = str(name or symbol).strip()
-    asof = date.today().isoformat()
-
+    # Fallback: fetch and populate (no keys needed)
     try:
-        st.cache_data.clear()
-    except Exception:
-        pass
+        fresh = fetch_universe()
+        upsert_universe(fresh)
+        uni2 = get_universe()
+        return uni2, True
+    except Exception as e:
+        return uni, False
 
-    px = yf_history_force(symbol, exchange)
-    upsert_prices(symbol, exchange, px)
+# ---------------- PAGES ----------------
 
-    fetched = 0
-    try:
-        fetched = upsert_news_items(symbol, exchange, name, days=60)
-    except Exception:
-        fetched = 0
-
-    m5, m60, recency_days = rss_counts(symbol, exchange)
-    nscore = news_score_from_rss(m5, m60, recency_days)
-
-    dbpx = get_prices_from_db(symbol, exchange)
-    feats = indicator_features(dbpx)
-    iscore, ibreak = indicator_score(feats)
-    cscore = combined_score(iscore, nscore, 0.8, 0.2)
-
-    reasons = {
-        "source": "Manual refresh",
-        "scores": {
-            "indicator_score": iscore,
-            "news_score": nscore,
-            "combined_score": cscore,
-            "w_ind": 0.8,
-            "w_news": 0.2,
-        },
-        "rss": {"fetched": fetched, "m5": m5, "m60": m60, "recency_days": recency_days},
-        "indicator": ibreak,
-    }
-    upsert_signal(symbol, exchange, asof, cscore, reasons)
-    return {"ok": True, "indicator_score": iscore, "news_score": nscore, "combined_score": cscore}
-
-
-# ---------------- Debug panel ----------------
-if debug_on:
-    with st.expander("🧪 Debug panel", expanded=False):
-        st.write("DB path:", str(DB_PATH))
-        with db() as con:
-            c_univ = con.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
-            c_wl = con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
-            c_px = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
-            c_news = con.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
-            c_sig = con.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        st.write({"universe": c_univ, "watchlist": c_wl, "prices": c_px, "news_items": c_news, "signals": c_sig})
-
-
-# ========================= PAGES =========================
 if page == "Discover & Add":
-    st.subheader("Discover & Add")
+    st.subheader("🔎 Discover stocks (NSE + BSE) and add with checkboxes")
 
-    uni, _ = ensure_universe_loaded()
-    uni = uni.copy()
-    if "sector" not in uni.columns:
-        uni["sector"] = "Unknown"
-    uni["sector"] = uni["sector"].fillna("Unknown")
+    uni, did_refresh = ensure_universe_loaded()
+    if did_refresh:
+        st.success("Universe was empty in this runtime — reloaded NSE+BSE universe now.")
 
-    uni["symbol"] = uni["symbol"].astype(str).str.strip().str.upper()
-    uni["exchange"] = uni["exchange"].astype(str).str.strip().str.upper()
-
-    c1, c2, c3 = st.columns([3, 4, 2])
-    with c1:
-        q = st.text_input("Search", placeholder="Type… (e.g., RELIANCE)")
-    with c2:
-        sectors_all = sorted([s for s in uni["sector"].astype(str).unique()])
-        sectors = st.multiselect("Sector (multi-select)", options=sectors_all, default=[])
-    with c3:
-        st.metric("Universe", f"{len(uni):,}")
-
-    show = uni
-    if sectors:
-        show = show[show["sector"].isin(sectors)]
-    if q:
-        mask = (
-            show["symbol"].str.contains(q, case=False, na=False)
-            | show["name"].astype(str).str.contains(q, case=False, na=False)
-        )
-        show = show[mask]
-    show = show.head(250).copy()
-
-    sig = latest_signals_per_stock()
-    if not sig.empty:
-        show = show.merge(sig[["symbol", "exchange", "score", "reasons"]], on=["symbol", "exchange"], how="left")
-    else:
-        show["score"] = 0
-        show["reasons"] = None
-
-    # signals.score is CombinedScore
-    show["combined_score"] = show["score"].fillna(0).astype(int)
-
-    # parse reasons -> IndicatorScore, NewsScore
-    inds = []
-    news = []
-    for rv in show["reasons"].tolist():
-        i, n, c = _extract_scores_from_reasons(rv)
-        inds.append(i)
-        news.append(n)
-    show["indicator_score"] = inds
-    show["news_score"] = news
-
-    show.insert(0, "add", False)
-    show = enrich_with_metrics(show, max_rows=30)
-
-    add_btn = st.button("➕ Add selected to Watchlist", use_container_width=True)
-
-    edited = st.data_editor(
-        show[
-            [
-                "add",
-                "exchange",
-                "symbol",
-                "name",
-                "sector",
-                "indicator_score",
-                "news_score",
-                "combined_score",
-                "live",
-                "52w_high",
-                "52w_low",
-                "ret_1d",
-                "ret_1w",
-                "ret_1m",
-                "ret_3m",
-                "ret_6m",
-                "ret_12m",
-            ]
-        ],
-        use_container_width=True,
-        height=560,
-        hide_index=True,
-        column_config={
-            "add": st.column_config.CheckboxColumn("Add"),
-            "indicator_score": st.column_config.NumberColumn("Indicator", format="%d"),
-            "news_score": st.column_config.NumberColumn("News", format="%d"),
-            "combined_score": st.column_config.NumberColumn("Combined", format="%d"),
-            "live": st.column_config.NumberColumn("Live", format="%.2f"),
-            "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
-            "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
-            "ret_1d": st.column_config.NumberColumn("1D %", format="%.2f"),
-            "ret_1w": st.column_config.NumberColumn("1W %", format="%.2f"),
-            "ret_1m": st.column_config.NumberColumn("1M %", format="%.2f"),
-            "ret_3m": st.column_config.NumberColumn("3M %", format="%.2f"),
-            "ret_6m": st.column_config.NumberColumn("6M %", format="%.2f"),
-            "ret_12m": st.column_config.NumberColumn("12M %", format="%.2f"),
-        },
-    )
-
-    selected = edited[edited["add"] == True][["symbol", "exchange"]].drop_duplicates()
-    st.info(f"Selected: **{len(selected)}**")
-
-    if add_btn:
-        add_to_watchlist_bulk(selected)
-        st.success("Added to watchlist.")
-        st.rerun()
-
-
-elif page == "Watchlist":
-    st.subheader("Watchlist (live stats + delete + story)")
-
-    wl = get_watchlist_df()
-    if wl.empty:
-        st.info("Watchlist is empty. Add from Discover.")
+    st.info(f"Universe loaded: **{len(uni):,}** rows")
+    if uni.empty:
+        st.error("Universe is still empty. This means Streamlit runtime didn't get the DB update AND live fetch failed.")
         st.stop()
 
-    sectors = sorted([s for s in wl["sector"].astype(str).unique()])
-    pick_sectors = st.multiselect("Filter by sector", options=sectors, default=[])
-    view = wl.copy()
-    if pick_sectors:
-        view = view[view["sector"].isin(pick_sectors)].copy()
-
-    sig = latest_signals_per_stock()
-    if not sig.empty:
-        df = view.merge(sig[["symbol", "exchange", "score", "reasons", "asof"]], on=["symbol", "exchange"], how="left")
+    # Search
+    q = st.text_input("Search (name or symbol)", placeholder="e.g., RELIANCE / TCS / VODAFONE / 500325")
+    if q:
+        mask = (
+            uni["symbol"].astype(str).str.contains(q, case=False, na=False) |
+            uni["name"].astype(str).str.contains(q, case=False, na=False)
+        )
+        show = uni[mask].head(500).copy()
     else:
-        df = view.copy()
-        df["score"] = 0
-        df["reasons"] = None
-        df["asof"] = None
+        show = uni.head(300).copy()  # fast preview
 
-    df["combined_score"] = df["score"].fillna(0).astype(int)
-
-    inds = []
-    news = []
-    for rv in df["reasons"].tolist():
-        i, n, c = _extract_scores_from_reasons(rv)
-        inds.append(i)
-        news.append(n)
-    df["indicator_score"] = inds
-    df["news_score"] = news
-
-    df = enrich_with_metrics(df, max_rows=30)
-    df = df.sort_values(["combined_score"], ascending=False).copy()
-    df.insert(0, "delete", False)
-
-    c1, c2 = st.columns([2, 4])
-    with c1:
-        del_btn = st.button("🗑️ Delete selected", use_container_width=True)
-    with c2:
-        st.caption("Refresh from Story panel to update Indicator + News + Combined scores.")
-
+    # Checkbox UI
+    show.insert(0, "add", False)
     edited = st.data_editor(
-        df[
-            [
-                "delete",
-                "exchange",
-                "symbol",
-                "name",
-                "sector",
-                "indicator_score",
-                "news_score",
-                "combined_score",
-                "live",
-                "52w_high",
-                "52w_low",
-                "ret_1d",
-                "ret_1w",
-                "ret_1m",
-                "ret_3m",
-                "ret_6m",
-                "ret_12m",
-            ]
-        ],
+        show[["add", "exchange", "symbol", "name", "isin"]],
         use_container_width=True,
         height=520,
         hide_index=True,
         column_config={
-            "delete": st.column_config.CheckboxColumn("Del"),
-            "indicator_score": st.column_config.NumberColumn("Indicator", format="%d"),
-            "news_score": st.column_config.NumberColumn("News", format="%d"),
-            "combined_score": st.column_config.NumberColumn("Combined", format="%d"),
-            "live": st.column_config.NumberColumn("Live", format="%.2f"),
-            "52w_high": st.column_config.NumberColumn("52W High", format="%.2f"),
-            "52w_low": st.column_config.NumberColumn("52W Low", format="%.2f"),
-            "ret_1d": st.column_config.NumberColumn("1D %", format="%.2f"),
-            "ret_1w": st.column_config.NumberColumn("1W %", format="%.2f"),
-            "ret_1m": st.column_config.NumberColumn("1M %", format="%.2f"),
-            "ret_3m": st.column_config.NumberColumn("3M %", format="%.2f"),
-            "ret_6m": st.column_config.NumberColumn("6M %", format="%.2f"),
-            "ret_12m": st.column_config.NumberColumn("12M %", format="%.2f"),
-        },
+            "add": st.column_config.CheckboxColumn("Add", help="Tick to add to watchlist"),
+        }
     )
 
-    to_del = edited[edited["delete"] == True][["symbol", "exchange"]].drop_duplicates()
-    if del_btn:
-        remove_from_watchlist_bulk(to_del)
-        st.success(f"Deleted {len(to_del)} item(s).")
-        st.rerun()
+    selected = edited[edited["add"] == True][["symbol", "exchange"]].drop_duplicates()
 
-    st.divider()
-    st.subheader("Stock story")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.write(f"Selected: **{len(selected)}**")
+    with col2:
+        if st.button("➕ Add selected to Watchlist", use_container_width=True):
+            add_to_watchlist_bulk(selected)
+            st.success(f"Added {len(selected)} stock(s) to watchlist.")
+            st.rerun()
 
-    options = edited.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist()
-    pick = st.selectbox("Select stock", options)
+    st.caption("Note: Scores/News/Prices will appear after GitHub Actions 'Update Data' runs again (since it processes watchlist).")
 
-    sel_sym = pick.split(" ")[0].strip().upper()
-    sel_ex = pick.split("(")[1].split(")")[0].strip().upper()
+elif page == "Watchlist":
+    st.subheader("📌 Your Watchlist (ranked by signals)")
+
+    wl = get_watchlist_df()
+    if wl.empty:
+        st.info("Watchlist is empty. Go to **Discover & Add**, tick stocks, and add them.")
+        st.stop()
+
+    sig = get_latest_signals()
+    ment = get_latest_mentions()
+
+    df = wl.merge(sig[["symbol","exchange","score","reasons"]], on=["symbol","exchange"], how="left") \
+           .merge(ment[["symbol","exchange","mentions","sample_headline","sample_url"]], on=["symbol","exchange"], how="left")
+
+    df["score"] = df["score"].fillna(0).astype(int)
+    df["mentions"] = df["mentions"].fillna(0).astype(int)
+    df = df.sort_values(["score","mentions"], ascending=False)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Watchlist size", int(len(df)))
+    c2.metric("Top score", int(df["score"].max()))
+    c3.metric("Total mentions (latest)", int(df["mentions"].sum()))
+
+    st.dataframe(
+        df[["exchange","symbol","name","score","mentions","sample_headline"]],
+        use_container_width=True,
+        height=420
+    )
+
+    pick = st.selectbox(
+        "Select stock to view story",
+        df.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist()
+    )
+    sel_sym = pick.split(" ")[0]
+    sel_ex = pick.split("(")[1].split(")")[0]
 
     row = df[(df.symbol == sel_sym) & (df.exchange == sel_ex)].iloc[0]
-    st.markdown(f"### **{row['name']}** — {sel_sym} ({sel_ex})")
+    st.markdown(f"### 🧾 Story: **{row['name']}** — {sel_sym} ({sel_ex})")
 
-    st.caption("Combined = 0.8×Indicator + 0.2×News")
-
-    if st.button("🔄 Refresh this stock now (Indicators + RSS + prices)", use_container_width=True):
-        res = refresh_one_stock(sel_sym, sel_ex, row["name"])
-        st.success(
-            f"Refreshed: Indicator={res['indicator_score']}  News={res['news_score']}  Combined={res['combined_score']}"
-        )
-        st.rerun()
-
-    st.markdown("#### 🧠 Why these scores?")
-    if row.get("reasons"):
-        try:
-            st.json(json.loads(row["reasons"]))
-        except Exception:
-            st.info("Score breakdown not available yet. Refresh once.")
-
-    st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
-    h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
-    if h is None or h.empty:
-        st.info("No RSS headlines stored yet. Click refresh once.")
+    if row.get("sample_url"):
+        st.write("Latest headline sample:", row.get("sample_headline",""))
+        st.link_button("Open article", row["sample_url"])
     else:
-        h = h.copy()
-        h["published"] = pd.to_datetime(h["published"], errors="coerce").dt.date
-        h = h.dropna(subset=["published"])
-        if h.empty:
-            st.info("No valid-dated headlines available.")
-        else:
-            h["_t"] = h["title"].astype(str).str.strip().str.lower()
-            h = h.drop_duplicates(subset=["published", "_t"]).drop(columns=["_t"])
-            latest_date = h["published"].max()
-            for pub_date in sorted(h["published"].unique(), reverse=True):
-                day_items = h[h["published"] == pub_date].copy().sort_values(["source", "title"])
-                with st.expander(
-                    f"📅 {pub_date} — {len(day_items)} headlines",
-                    expanded=(pub_date == latest_date),
-                ):
-                    for _, rr in day_items.iterrows():
-                        st.write(f"• {rr['title']}  ({rr['source']})")
-                        if is_valid_url(rr["url"]):
-                            st.link_button("Open", rr["url"])
+        st.info("No headline stored yet. Run GitHub Actions again after adding stocks.")
 
-    st.markdown("#### 📈 Price chart")
-    px = get_prices_from_db(sel_sym, sel_ex)
-    if px.empty:
-        px = yf_history_force(sel_sym, sel_ex)
-
+    px = get_prices(sel_sym, sel_ex)
     if not px.empty and px["close"].notna().any():
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=px["date"], y=px["close"], mode="lines", name="Price"))
-        fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
+        fig.add_trace(go.Scatter(x=px["date"], y=px["close"], mode="lines", name="Close"))
+        fig.update_layout(height=380, margin=dict(l=10,r=10,t=30,b=10), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("No price data available from free source for this ticker.")
+        st.warning("No price data yet. Run GitHub Actions again (it fetches prices for watchlist stocks).")
 
+    if row.get("reasons"):
+        try:
+            reasons = json.loads(row["reasons"])
+            st.write("**Why this score?**")
+            st.json(reasons)
+        except Exception:
+            pass
 
-else:
-    st.subheader("Paper Trading (demo)")
+    if st.button("🗑️ Remove from watchlist", use_container_width=True):
+        remove_from_watchlist(sel_sym, sel_ex)
+        st.rerun()
+
+elif page == "Paper Trading":
+    st.subheader("🧪 Paper Trading (demo coins)")
+
     with db() as con:
         cash = float(con.execute("SELECT cash FROM paper_wallet WHERE id=1").fetchone()[0])
         trades = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY ts DESC LIMIT 200", con)
+
     st.metric("Demo cash", round(cash, 2))
-    st.dataframe(trades, use_container_width=True, height=420)
+
+    wl = get_watchlist_df()
+    if wl.empty:
+        st.info("Add stocks to watchlist first.")
+        st.stop()
+
+    pick = st.selectbox("Trade symbol", wl.apply(lambda r: f'{r["symbol"]} ({r["exchange"]}) — {r["name"]}', axis=1).tolist())
+    sel_sym = pick.split(" ")[0]
+    sel_ex = pick.split("(")[1].split(")")[0]
+
+    px = get_prices(sel_sym, sel_ex)
+    last_price = float(px["close"].dropna().iloc[-1]) if not px.empty and px["close"].notna().any() else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    side = c1.selectbox("Side", ["BUY","SELL"])
+    qty = c2.number_input("Qty", min_value=1.0, value=1.0, step=1.0)
+    price = c3.number_input("Price", min_value=0.0, value=last_price, step=0.5)
+
+    notes = st.text_input("Notes (optional)", placeholder="e.g., Score>=90 auto rule / Manual conviction / News spike")
+
+    if st.button("✅ Place paper trade", use_container_width=True):
+        ts = pd.Timestamp.utcnow().isoformat()
+        cost = qty * price
+        with db() as con:
+            if side == "BUY" and cost > cash:
+                st.error("Not enough demo cash.")
+            else:
+                con.execute(
+                    "INSERT INTO paper_trades(ts,symbol,exchange,side,qty,price,notes) VALUES (?,?,?,?,?,?,?)",
+                    (ts, sel_sym, sel_ex, side, float(qty), float(price), notes)
+                )
+                new_cash = cash - cost if side == "BUY" else cash + cost
+                con.execute("UPDATE paper_wallet SET cash=? WHERE id=1", (new_cash,))
+                con.commit()
+                st.success(f"Paper trade placed: {side} {qty} @ {price}")
+
+    st.write("Recent trades")
+    st.dataframe(trades, use_container_width=True, height=320)
