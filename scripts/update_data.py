@@ -4,9 +4,9 @@ from datetime import date
 import pandas as pd
 import yfinance as yf
 
-from lib.db import init_db, db
+from lib.db import init_db, db, DB_PATH
 from lib.prices import to_yahoo_ticker
-from lib.news_rss import fetch_google_news_rss, headline_sentiment
+from lib.news_rss import fetch_google_news_rss
 from lib.scoring import indicator_features, indicator_score, combined_score
 
 
@@ -27,10 +27,13 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def yf_daily_try(ticker: str) -> pd.DataFrame:
-    raw = yf.download(ticker, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+def yf_daily(symbol: str, exchange: str):
+    t = to_yahoo_ticker(symbol, exchange)
+    raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
+
     if raw is None or raw.empty:
-        return pd.DataFrame(columns=["date", "close", "volume"])
+        return pd.DataFrame(columns=["date", "close", "volume"]), {"ticker": t, "rows": 0}
+
     df = _flatten_yf_columns(raw.reset_index())
     dcol = "Date" if "Date" in df.columns else df.columns[0]
     df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
@@ -38,7 +41,7 @@ def yf_daily_try(ticker: str) -> pd.DataFrame:
     close_s = df["Close"] if "Close" in df.columns else None
     vol_s = df["Volume"] if "Volume" in df.columns else None
     if close_s is None:
-        return pd.DataFrame(columns=["date", "close", "volume"])
+        return pd.DataFrame(columns=["date", "close", "volume"]), {"ticker": t, "rows": 0}
 
     if isinstance(close_s, pd.DataFrame):
         close_s = close_s.iloc[:, 0]
@@ -47,39 +50,9 @@ def yf_daily_try(ticker: str) -> pd.DataFrame:
 
     df["close"] = pd.to_numeric(close_s, errors="coerce")
     df["volume"] = pd.to_numeric(vol_s, errors="coerce") if vol_s is not None else None
-    return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
 
-
-def yf_daily(symbol: str, exchange: str):
-    """
-    Stronger fetch:
-    1) Yahoo mapped ticker (e.g., RCOM.NS)
-    2) If empty, try raw symbol (rare Yahoo variants)
-    3) If empty, try alternate suffix (.NS/.BO swap)
-    """
-    t_main = to_yahoo_ticker(symbol, exchange)
-    df = yf_daily_try(t_main)
-    if not df.empty:
-        return df, {"ticker_used": t_main, "fallback": "none", "rows": len(df)}
-
-    # Try raw symbol (sometimes Yahoo uses special forms)
-    df2 = yf_daily_try(symbol)
-    if not df2.empty:
-        return df2, {"ticker_used": symbol, "fallback": "raw_symbol", "rows": len(df2)}
-
-    # Try alternate suffix swap
-    if t_main.endswith(".NS"):
-        alt = f"{symbol}.BO"
-    elif t_main.endswith(".BO"):
-        alt = f"{symbol}.NS"
-    else:
-        alt = t_main
-
-    df3 = yf_daily_try(alt)
-    if not df3.empty:
-        return df3, {"ticker_used": alt, "fallback": "suffix_swap", "rows": len(df3)}
-
-    return pd.DataFrame(columns=["date", "close", "volume"]), {"ticker_used": t_main, "fallback": "failed", "rows": 0}
+    out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+    return out, {"ticker": t, "rows": int(len(out))}
 
 
 def upsert_prices(symbol, exchange, df):
@@ -119,96 +92,6 @@ def upsert_news(symbol, exchange, name, days=60):
     return len(items)
 
 
-def rss_counts_and_sentiment(symbol, exchange):
-    """
-    Reads stored news_items and computes:
-    - m5, m60 counts
-    - sentiment balance from titles (simple, free)
-    """
-    import datetime as dt
-    from datetime import timedelta
-
-    today = dt.date.today()
-    with db() as con:
-        df = pd.read_sql_query(
-            "SELECT published, title, source FROM news_items WHERE symbol=? AND exchange=?",
-            con,
-            params=(symbol, exchange),
-        )
-
-    if df.empty:
-        return 0, 0, 999, {"pos": 0, "neg": 0, "neu": 0, "label": "neutral"}
-
-    df["published"] = pd.to_datetime(df["published"], errors="coerce").dt.date
-    df = df.dropna(subset=["published"])
-    if df.empty:
-        return 0, 0, 999, {"pos": 0, "neg": 0, "neu": 0, "label": "neutral"}
-
-    in5 = df[(today - df["published"]) <= timedelta(days=5)]
-    in60 = df[(today - df["published"]) <= timedelta(days=60)]
-    m5 = int(len(in5))
-    m60 = int(len(in60))
-    last = df["published"].max()
-    recency_days = (today - last).days if last else 999
-
-    # Sentiment from titles (simple keyword model)
-    pos = neg = neu = 0
-    for t in in60["title"].astype(str).tolist():
-        s = headline_sentiment(t)
-        if s["label"] == "positive":
-            pos += 1
-        elif s["label"] == "negative":
-            neg += 1
-        else:
-            neu += 1
-
-    label = "neutral"
-    if pos >= neg + 3:
-        label = "positive"
-    elif neg >= pos + 3:
-        label = "negative"
-
-    return m5, m60, recency_days, {"pos": pos, "neg": neg, "neu": neu, "label": label}
-
-
-def news_score(m5, m60, recency_days, sent_label):
-    """
-    Intensity/recency score (0..100), then adjust by sentiment label.
-    Negative news should NOT become a buy trigger.
-    """
-    baseline = max(1.0, m60 / 12.0)
-    intensity_ratio = m5 / baseline
-
-    # 0..60
-    intensity_pts = (intensity_ratio - 0.5) * 30.0
-    intensity_pts = float(max(0.0, min(60.0, intensity_pts)))
-
-    # 0..40
-    if recency_days <= 2:
-        recency_pts = 40
-    elif recency_days <= 5:
-        recency_pts = 30
-    elif recency_days <= 10:
-        recency_pts = 20
-    elif recency_days <= 20:
-        recency_pts = 10
-    else:
-        recency_pts = 0
-
-    raw = float(min(100.0, intensity_pts + recency_pts))
-
-    # Sentiment adjustment
-    if sent_label == "negative":
-        # cap hard: a negative spike should not look "great"
-        adj = min(raw * 0.35, 35.0)
-    elif sent_label == "neutral":
-        adj = raw * 0.7
-    else:
-        adj = raw
-
-    return int(max(0, min(100, round(adj))))
-
-
 def upsert_signal(symbol, exchange, asof, combined_val, reasons):
     with db() as con:
         con.execute(
@@ -221,6 +104,7 @@ def upsert_signal(symbol, exchange, asof, combined_val, reasons):
 def main():
     init_db()
     asof = date.today().isoformat()
+    print("DB_PATH =", DB_PATH)
 
     with db() as con:
         wl = pd.read_sql_query(
@@ -231,6 +115,7 @@ def main():
             """,
             con,
         )
+    print("watchlist rows =", len(wl))
 
     if wl.empty:
         print("Watchlist empty. Nothing to update.")
@@ -241,16 +126,12 @@ def main():
         exchange = str(r.exchange).strip().upper()
         name = str(r.name).strip()
 
-        # Prices
-        px, px_meta = yf_daily(symbol, exchange)
-        inserted = upsert_prices(symbol, exchange, px)
+        px, meta = yf_daily(symbol, exchange)
+        ins_px = upsert_prices(symbol, exchange, px)
 
-        # News
-        fetched = upsert_news(symbol, exchange, name, days=60)
-        m5, m60, recency_days, sent = rss_counts_and_sentiment(symbol, exchange)
-        nscore = news_score(m5, m60, recency_days, sent["label"])
+        ins_news = upsert_news(symbol, exchange, name, days=60)
 
-        # IndicatorScore from DB prices
+        # Pull DB prices for scoring
         with db() as con:
             dbpx = pd.read_sql_query(
                 "SELECT date, close, volume FROM prices WHERE symbol=? AND exchange=? ORDER BY date",
@@ -260,38 +141,27 @@ def main():
 
         feats = indicator_features(dbpx)
         iscore, ibreak = indicator_score(feats)
+
+        # (NewsScore can remain 0 for now; we’ll wire sentiment next after prices work)
+        nscore = 0
         cscore = combined_score(iscore, nscore, 0.8, 0.2)
 
         reasons = {
             "source": "Daily update (Actions)",
-            "name": name,
-            "scores": {
-                "indicator_score": iscore,
-                "news_score": nscore,
-                "combined_score": cscore,
-                "w_ind": 0.8,
-                "w_news": 0.2,
-            },
-            "prices": {
-                "yahoo_ticker": px_meta.get("ticker_used"),
-                "fallback": px_meta.get("fallback"),
-                "rows_fetched": px_meta.get("rows"),
-                "rows_inserted": inserted,
-                "rows_db": int(len(dbpx)),
-            },
-            "rss": {
-                "fetched": fetched,
-                "m5": m5,
-                "m60": m60,
-                "recency_days": recency_days,
-                "sentiment": sent,
-            },
+            "scores": {"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind": 0.8, "w_news": 0.2},
+            "prices": {"yahoo_ticker": meta["ticker"], "rows_fetched": meta["rows"], "rows_inserted": ins_px, "rows_db": int(len(dbpx))},
+            "rss": {"rows_inserted": ins_news},
             "indicator": ibreak,
         }
-
         upsert_signal(symbol, exchange, asof, cscore, reasons)
-        print(symbol, exchange, "PX_ins", inserted, "DB_px", len(dbpx), "Ind", iscore, "News", nscore, "Comb", cscore)
 
+        print(symbol, exchange, "yf_rows", meta["rows"], "ins_px", ins_px, "db_px", len(dbpx), "news_ins", ins_news)
+
+    with db() as con:
+        total_px = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        total_news = con.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
+        total_sig = con.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    print("TOTAL prices =", total_px, "news_items =", total_news, "signals =", total_sig)
     print("Done.")
 
 
