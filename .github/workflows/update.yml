@@ -13,11 +13,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout latest
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -39,17 +39,24 @@ jobs:
         run: |
           find . -type d -name "__pycache__" -prune -exec rm -rf {} +
           find . -type f -name "*.pyc" -delete
-          # remove sqlite wal/shm if created anywhere
           find . -type f -name "*.db-wal" -delete
           find . -type f -name "*.db-shm" -delete
 
-      - name: Commit DB only
+      - name: Commit & push (rebase-safe)
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          # Commit only the database file
-          git add data/stock.db
+          # Always integrate latest remote main first
+          git fetch origin main
+          git rebase origin/main || (git rebase --abort && git pull --rebase origin main)
 
-          git commit -m "Auto update data" || echo "No DB changes"
-          git push
+          # Only commit DB + watchlist file (keeps repo clean)
+          git add data/stock.db data/watchlist.csv || true
+
+          git status
+
+          git commit -m "Auto update data" || echo "No changes to commit"
+
+          # Push after rebase
+          git push origin HEAD:main
