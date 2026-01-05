@@ -1,24 +1,21 @@
 def to_yahoo_ticker(symbol: str, exchange: str) -> str:
     """
-    Convert NSE/BSE symbol to Yahoo Finance ticker.
-    NSE -> .NS
-    BSE -> .BO
-
-    Handles common exchange labels from different universe sources.
+    NSE -> .NS, BSE -> .BO for Yahoo Finance.
     """
-    sym = (symbol or "").strip().upper()
+    s = (symbol or "").strip().upper()
     ex = (exchange or "").strip().upper()
 
-    # If already a Yahoo-style ticker, return as-is
-    if sym.endswith(".NS") or sym.endswith(".BO"):
-        return sym
+    if not s:
+        return ""
 
-    # Normalize exchange
-    # Many sources use NSE/BSE, sometimes NSEEQ, BSEEQ, "NSE" with extra text.
-    if "NSE" in ex or ex in {"NS"}:
-        return f"{sym}.NS"
-    if "BSE" in ex or ex in {"BO"}:
-        return f"{sym}.BO"
+    # already has suffix
+    if s.endswith(".NS") or s.endswith(".BO"):
+        return s
 
-    # Fallback: assume NSE if unknown (best default for India watchlists)
-    return f"{sym}.NS"
+    if ex == "NSE":
+        return f"{s}.NS"
+    if ex == "BSE":
+        return f"{s}.BO"
+
+    # default: return symbol as-is
+    return s
