@@ -8,14 +8,12 @@ def github_put_file(path: str, content_text: str, message: str):
     repo = st.secrets.get("GH_REPO", "")
     branch = st.secrets.get("GH_BRANCH", "main")
 
-    # If secrets not configured, do nothing (local-only mode)
     if not token or not owner or not repo:
         return {"ok": False, "error": "Missing GH_* secrets"}
 
     api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    # Get current sha if file exists
     r0 = requests.get(api, headers=headers, params={"ref": branch}, timeout=30)
     sha = None
     if r0.status_code == 200:
