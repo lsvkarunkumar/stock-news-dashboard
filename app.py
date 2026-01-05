@@ -2,6 +2,7 @@ import json
 import math
 import datetime as dt
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,7 +16,16 @@ from lib.prices import to_yahoo_ticker
 from lib.news_rss import fetch_google_news_rss
 from lib.scoring import indicator_features, indicator_score, combined_score
 
+# Optional GitHub sync (only works if Streamlit secrets are set)
+try:
+    from lib.github_sync import github_put_file
+except Exception:
+    github_put_file = None
+
 st.set_page_config(page_title="News × Price Dashboard", layout="wide")
+
+REPO_ROOT = Path(__file__).resolve().parent
+WATCHLIST_CSV = REPO_ROOT / "data" / "watchlist.csv"
 
 
 def load_css():
@@ -86,44 +96,96 @@ def _extract_scores_from_reasons(reasons_val):
     return ind, news, comb
 
 
-# ---------------- DB ops ----------------
+# ---------------- Watchlist (CSV) ----------------
+def ensure_watchlist_file():
+    WATCHLIST_CSV.parent.mkdir(parents=True, exist_ok=True)
+    if not WATCHLIST_CSV.exists():
+        WATCHLIST_CSV.write_text("symbol,exchange\n", encoding="utf-8")
+
+
+def read_watchlist_csv() -> pd.DataFrame:
+    ensure_watchlist_file()
+    try:
+        df = pd.read_csv(WATCHLIST_CSV)
+    except Exception:
+        df = pd.DataFrame(columns=["symbol", "exchange"])
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "exchange"])
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["exchange"] = df["exchange"].astype(str).str.strip().str.upper()
+    return df.drop_duplicates(subset=["symbol", "exchange"]).reset_index(drop=True)
+
+
+def write_watchlist_csv(df: pd.DataFrame):
+    ensure_watchlist_file()
+    df = normalize_df(df)
+    df.to_csv(WATCHLIST_CSV, index=False)
+
+
+def sync_watchlist_to_github(df: pd.DataFrame, message: str):
+    # If secrets not provided, just keep local CSV (manual mode)
+    if github_put_file is None:
+        return {"ok": False, "error": "github_sync not available"}
+    try:
+        csv_text = df.to_csv(index=False)
+        res = github_put_file("data/watchlist.csv", csv_text, message)
+        return res
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def add_to_watchlist_bulk(rows: pd.DataFrame):
     if rows is None or rows.empty:
         return
-    clean = normalize_df(rows)
-    with db() as con:
-        con.executemany(
-            "INSERT OR IGNORE INTO watchlist(symbol, exchange, added_at) VALUES (?,?,?)",
-            [(r.symbol, r.exchange, date.today().isoformat()) for r in clean.itertuples(index=False)],
-        )
-        con.commit()
+    new_rows = normalize_df(rows)[["symbol", "exchange"]]
+    wl = read_watchlist_csv()
+    wl2 = pd.concat([wl, new_rows], axis=0, ignore_index=True).drop_duplicates(subset=["symbol", "exchange"])
+    write_watchlist_csv(wl2)
+
+    # Try auto-sync to GitHub if secrets exist
+    if github_put_file is not None:
+        sync_watchlist_to_github(wl2, "Update watchlist.csv (add)")
 
 
 def remove_from_watchlist_bulk(rows: pd.DataFrame):
     if rows is None or rows.empty:
         return
-    clean = normalize_df(rows)
-    with db() as con:
-        con.executemany(
-            "DELETE FROM watchlist WHERE symbol=? AND exchange=?",
-            [(r.symbol, r.exchange) for r in clean.itertuples(index=False)],
-        )
-        con.commit()
+    rem = normalize_df(rows)[["symbol", "exchange"]]
+    wl = read_watchlist_csv()
+    if wl.empty:
+        return
+    merged = wl.merge(rem.assign(_rm=1), on=["symbol", "exchange"], how="left")
+    wl2 = merged[merged["_rm"].isna()][["symbol", "exchange"]].copy()
+    write_watchlist_csv(wl2)
+
+    if github_put_file is not None:
+        sync_watchlist_to_github(wl2, "Update watchlist.csv (delete)")
 
 
 def get_watchlist_df():
-    with db() as con:
-        return pd.read_sql_query(
-            """
-            SELECT w.symbol, w.exchange, u.name, COALESCE(u.sector,'Unknown') AS sector, w.added_at
-            FROM watchlist w
-            LEFT JOIN universe u ON u.symbol=w.symbol AND u.exchange=w.exchange
-            ORDER BY w.added_at DESC
-            """,
-            con,
-        )
+    wl = read_watchlist_csv()
+    if wl.empty:
+        return wl
+
+    uni = get_universe().copy()
+    if uni is None or uni.empty:
+        uni, _ = ensure_universe_loaded()
+
+    if "sector" not in uni.columns:
+        uni["sector"] = "Unknown"
+    uni["sector"] = uni["sector"].fillna("Unknown")
+
+    uni["symbol"] = uni["symbol"].astype(str).str.strip().str.upper()
+    uni["exchange"] = uni["exchange"].astype(str).str.strip().str.upper()
+
+    df = wl.merge(uni[["symbol", "exchange", "name", "sector"]], on=["symbol", "exchange"], how="left")
+    df["name"] = df["name"].fillna(df["symbol"])
+    df["sector"] = df["sector"].fillna("Unknown")
+    df["added_at"] = ""  # optional; kept for layout compatibility
+    return df
 
 
+# ---------------- Signals/Prices/News in DB ----------------
 def latest_signals_per_stock():
     with db() as con:
         return pd.read_sql_query(
@@ -159,7 +221,7 @@ def get_prices_from_db(symbol, exchange):
         )
 
 
-# ---------------- Market data fallback (if DB empty) ----------------
+# ---------------- Market data fallback (display only) ----------------
 def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -259,8 +321,7 @@ def enrich_with_metrics_db(df: pd.DataFrame, max_rows: int = 50) -> pd.DataFrame
     for r in take.itertuples(index=False):
         px = get_prices_from_db(r.symbol, r.exchange)
         if px.empty:
-            # fallback once (won’t persist) just to display something
-            px = yf_daily_fallback(r.symbol, r.exchange)
+            px = yf_daily_fallback(r.symbol, r.exchange)  # display-only fallback
         metrics.append(compute_metrics(px))
     met = pd.DataFrame(metrics)
     take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
@@ -358,7 +419,6 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
     m5, m60, recency_days = rss_counts(symbol, exchange)
     nscore = news_score_from_rss(m5, m60, recency_days)
 
-    # Indicator uses DB prices (Actions should fill these)
     dbpx = get_prices_from_db(symbol, exchange)
     feats = indicator_features(dbpx)
     iscore, ibreak = indicator_score(feats)
@@ -371,6 +431,7 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
         "indicator": ibreak,
         "yahoo_ticker": to_yahoo_ticker(symbol, exchange),
         "price_rows_db": int(len(dbpx)),
+        "watchlist_source": "data/watchlist.csv",
     }
     upsert_signal(symbol, exchange, asof, cscore, reasons)
     return {"ok": True, "indicator_score": iscore, "news_score": nscore, "combined_score": cscore}
@@ -380,13 +441,15 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
 if debug_on:
     with st.expander("🧪 Debug panel", expanded=False):
         st.write("DB path:", str(DB_PATH))
+        st.write("Watchlist CSV:", str(WATCHLIST_CSV))
+        wl_now = read_watchlist_csv()
+        st.write("watchlist.csv rows:", int(len(wl_now)))
         with db() as con:
             c_univ = con.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
-            c_wl = con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
             c_px = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
             c_news = con.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
             c_sig = con.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        st.write({"universe": c_univ, "watchlist": c_wl, "prices": c_px, "news_items": c_news, "signals": c_sig})
+        st.write({"universe": c_univ, "prices": c_px, "news_items": c_news, "signals": c_sig})
 
 
 # ========================= PAGES =========================
@@ -471,7 +534,7 @@ if page == "Discover & Add":
 
     if add_btn:
         add_to_watchlist_bulk(selected)
-        st.success("Added to watchlist.")
+        st.success("Added to watchlist (watchlist.csv). If GH secrets are set, it auto-syncs to GitHub.")
         st.rerun()
 
 
@@ -513,15 +576,13 @@ elif page == "Watchlist":
         use_container_width=True,
         height=520,
         hide_index=True,
-        column_config={
-            "delete": st.column_config.CheckboxColumn("Del"),
-        },
+        column_config={"delete": st.column_config.CheckboxColumn("Del")},
     )
 
     to_del = edited[edited["delete"] == True][["symbol", "exchange"]].drop_duplicates()
     if del_btn:
         remove_from_watchlist_bulk(to_del)
-        st.success(f"Deleted {len(to_del)} item(s).")
+        st.success(f"Deleted {len(to_del)} item(s) from watchlist.csv.")
         st.rerun()
 
     st.divider()
@@ -574,7 +635,7 @@ elif page == "Watchlist":
     st.markdown("#### 📈 Price chart (from DB)")
     px = get_prices_from_db(sel_sym, sel_ex)
     if px.empty:
-        st.warning("No DB price rows yet for this stock. Run Actions or check ticker mapping.")
+        st.warning("No DB price rows yet. Run GitHub Actions after watchlist.csv is synced to GitHub.")
     else:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=px["date"], y=px["close"], mode="lines", name="Price"))
