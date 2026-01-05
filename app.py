@@ -123,7 +123,6 @@ def write_watchlist_csv(df: pd.DataFrame):
 
 
 def sync_watchlist_to_github(df: pd.DataFrame, message: str):
-    # If secrets not provided, just keep local CSV (manual mode)
     if github_put_file is None:
         return {"ok": False, "error": "github_sync not available"}
     try:
@@ -142,7 +141,6 @@ def add_to_watchlist_bulk(rows: pd.DataFrame):
     wl2 = pd.concat([wl, new_rows], axis=0, ignore_index=True).drop_duplicates(subset=["symbol", "exchange"])
     write_watchlist_csv(wl2)
 
-    # Try auto-sync to GitHub if secrets exist
     if github_put_file is not None:
         sync_watchlist_to_github(wl2, "Update watchlist.csv (add)")
 
@@ -181,7 +179,7 @@ def get_watchlist_df():
     df = wl.merge(uni[["symbol", "exchange", "name", "sector"]], on=["symbol", "exchange"], how="left")
     df["name"] = df["name"].fillna(df["symbol"])
     df["sector"] = df["sector"].fillna("Unknown")
-    df["added_at"] = ""  # optional; kept for layout compatibility
+    df["added_at"] = ""
     return df
 
 
@@ -221,7 +219,30 @@ def get_prices_from_db(symbol, exchange):
         )
 
 
-# ---------------- Market data fallback (display only) ----------------
+def upsert_prices_to_db(symbol: str, exchange: str, df: pd.DataFrame) -> int:
+    """Persist yfinance prices into DB so indicator score can work."""
+    if df is None or df.empty:
+        return 0
+    rows = []
+    for _, r in df.iterrows():
+        d = r.get("date")
+        c = r.get("close")
+        v = r.get("volume")
+        if pd.isna(d) or pd.isna(c):
+            continue
+        rows.append((symbol, exchange, str(d), float(c), float(v) if pd.notna(v) else None))
+    if not rows:
+        return 0
+    with db() as con:
+        con.executemany(
+            "INSERT OR REPLACE INTO prices(symbol, exchange, date, close, volume) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        con.commit()
+    return len(rows)
+
+
+# ---------------- Market data fallback (fetch) ----------------
 def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -239,7 +260,7 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def yf_daily_fallback(symbol: str, exchange: str) -> pd.DataFrame:
+def yf_daily(symbol: str, exchange: str) -> pd.DataFrame:
     t = to_yahoo_ticker(symbol, exchange)
     raw = yf.download(t, period="370d", interval="1d", progress=False, threads=True, auto_adjust=False)
     if raw is None or raw.empty:
@@ -247,20 +268,24 @@ def yf_daily_fallback(symbol: str, exchange: str) -> pd.DataFrame:
     df = _flatten_yf_columns(raw.reset_index())
     dcol = "Date" if "Date" in df.columns else df.columns[0]
     df["date"] = pd.to_datetime(df[dcol], errors="coerce").dt.date.astype(str)
+
     close = df["Close"] if "Close" in df.columns else None
     vol = df["Volume"] if "Volume" in df.columns else None
     if close is None:
         return pd.DataFrame(columns=["date", "close", "volume"])
+
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     if isinstance(vol, pd.DataFrame):
         vol = vol.iloc[:, 0]
+
     df["close"] = pd.to_numeric(close, errors="coerce")
     df["volume"] = pd.to_numeric(vol, errors="coerce") if vol is not None else np.nan
-    return df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+    out = df[["date", "close", "volume"]].dropna(subset=["date", "close"])
+    return out
 
 
-# --------- Metrics (DB first) ---------
+# --------- Metrics (DB first; if empty, show yfinance but also store if user refreshes) ---------
 def compute_metrics(prices: pd.DataFrame) -> dict:
     out = {
         "live": np.nan,
@@ -321,7 +346,7 @@ def enrich_with_metrics_db(df: pd.DataFrame, max_rows: int = 50) -> pd.DataFrame
     for r in take.itertuples(index=False):
         px = get_prices_from_db(r.symbol, r.exchange)
         if px.empty:
-            px = yf_daily_fallback(r.symbol, r.exchange)  # display-only fallback
+            px = yf_daily(r.symbol, r.exchange)  # display-only
         metrics.append(compute_metrics(px))
     met = pd.DataFrame(metrics)
     take2 = pd.concat([take.reset_index(drop=True), met], axis=1)
@@ -346,20 +371,26 @@ def upsert_news_items(symbol: str, exchange: str, company_name: str, days: int =
     return len(items)
 
 
-def rss_counts(symbol: str, exchange: str):
+def rss_counts_dedup(symbol: str, exchange: str):
+    """Counts mentions after de-duplicating titles (prevents m5 from exploding)."""
     today = dt.date.today()
     with db() as con:
         df = pd.read_sql_query(
-            "SELECT published FROM news_items WHERE symbol=? AND exchange=?",
+            "SELECT published, title FROM news_items WHERE symbol=? AND exchange=?",
             con,
             params=(symbol, exchange),
         )
     if df.empty:
         return 0, 0, 999
+
     df["published"] = pd.to_datetime(df["published"], errors="coerce").dt.date
+    df["title"] = df["title"].astype(str).str.strip().str.lower()
     df = df.dropna(subset=["published"])
     if df.empty:
         return 0, 0, 999
+
+    df = df.drop_duplicates(subset=["published", "title"])
+
     m5 = int((today - df["published"] <= dt.timedelta(days=5)).sum())
     m60 = int((today - df["published"] <= dt.timedelta(days=60)).sum())
     last = df["published"].max()
@@ -368,24 +399,29 @@ def rss_counts(symbol: str, exchange: str):
 
 
 def news_score_from_rss(m5: int, m60: int, recency_days: int) -> int:
-    baseline = max(1.0, m60 / 12.0)
-    intensity_ratio = m5 / baseline
-    intensity_pts = (intensity_ratio - 0.5) * 30.0
-    intensity_pts = float(max(0.0, min(60.0, intensity_pts)))
+    """
+    New stable scoring (no more always-100):
+    - Uses log scale for intensity
+    - Dedup counts are assumed
+    """
+    # intensity: log scaled
+    intensity = math.log1p(m5) / math.log1p(30)  # 0..~1 when m5 up to ~30
+    intensity_pts = int(round(min(60, max(0, intensity * 60))))
 
-    if recency_days <= 2:
+    # recency points
+    if recency_days <= 1:
         recency_pts = 40
-    elif recency_days <= 5:
+    elif recency_days <= 3:
         recency_pts = 30
-    elif recency_days <= 10:
+    elif recency_days <= 7:
         recency_pts = 20
-    elif recency_days <= 20:
+    elif recency_days <= 14:
         recency_pts = 10
     else:
         recency_pts = 0
 
-    score = int(round(min(100.0, intensity_pts + recency_pts)))
-    return max(0, min(100, score))
+    score = intensity_pts + recency_pts
+    return max(0, min(100, int(score)))
 
 
 def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.DataFrame:
@@ -403,23 +439,35 @@ def latest_rss_headlines(symbol: str, exchange: str, limit: int = 60) -> pd.Data
         )
 
 
-# ---------------- Refresh (Indicators + RSS) ----------------
+# ---------------- Refresh (Indicators + RSS + PRICES to DB) ----------------
 def refresh_one_stock(symbol: str, exchange: str, name: str):
     symbol = str(symbol).strip().upper()
     exchange = str(exchange).strip().upper()
     name = str(name or symbol).strip()
     asof = date.today().isoformat()
 
-    fetched = 0
+    # 1) Fetch and store RSS
+    fetched_news = 0
     try:
-        fetched = upsert_news_items(symbol, exchange, name, days=60)
+        fetched_news = upsert_news_items(symbol, exchange, name, days=60)
     except Exception:
-        fetched = 0
+        fetched_news = 0
 
-    m5, m60, recency_days = rss_counts(symbol, exchange)
+    m5, m60, recency_days = rss_counts_dedup(symbol, exchange)
     nscore = news_score_from_rss(m5, m60, recency_days)
 
+    # 2) If DB has no prices yet, fetch from Yahoo and STORE into DB
     dbpx = get_prices_from_db(symbol, exchange)
+    inserted_px = 0
+    if dbpx.empty:
+        try:
+            yfpx = yf_daily(symbol, exchange)
+            inserted_px = upsert_prices_to_db(symbol, exchange, yfpx)
+            dbpx = get_prices_from_db(symbol, exchange)
+        except Exception:
+            inserted_px = 0
+
+    # 3) Indicator scoring uses DB prices
     feats = indicator_features(dbpx)
     iscore, ibreak = indicator_score(feats)
     cscore = combined_score(iscore, nscore, 0.8, 0.2)
@@ -427,7 +475,8 @@ def refresh_one_stock(symbol: str, exchange: str, name: str):
     reasons = {
         "source": "Manual refresh",
         "scores": {"indicator_score": iscore, "news_score": nscore, "combined_score": cscore, "w_ind": 0.8, "w_news": 0.2},
-        "rss": {"fetched": fetched, "m5": m5, "m60": m60, "recency_days": recency_days},
+        "rss": {"fetched": fetched_news, "m5": m5, "m60": m60, "recency_days": recency_days},
+        "prices": {"inserted_rows": inserted_px, "rows_db": int(len(dbpx))},
         "indicator": ibreak,
         "yahoo_ticker": to_yahoo_ticker(symbol, exchange),
         "price_rows_db": int(len(dbpx)),
@@ -598,7 +647,7 @@ elif page == "Watchlist":
     st.markdown(f"### **{row['name']}** — {sel_sym} ({sel_ex})")
     st.caption("Combined = 0.8×Indicator + 0.2×News")
 
-    if st.button("🔄 Refresh scores now (Indicators + RSS)", use_container_width=True):
+    if st.button("🔄 Refresh scores now (RSS + PRICES + Indicators)", use_container_width=True):
         res = refresh_one_stock(sel_sym, sel_ex, row["name"])
         st.success(f"Refreshed: Indicator={res['indicator_score']}  News={res['news_score']}  Combined={res['combined_score']}")
         st.rerun()
@@ -608,7 +657,7 @@ elif page == "Watchlist":
         try:
             st.json(json.loads(row["reasons"]))
         except Exception:
-            st.info("Score breakdown not available yet. Run Actions once more.")
+            st.info("Score breakdown not available yet.")
 
     st.markdown("#### 📰 Latest RSS headlines (grouped by date)")
     h = latest_rss_headlines(sel_sym, sel_ex, limit=60)
@@ -635,7 +684,7 @@ elif page == "Watchlist":
     st.markdown("#### 📈 Price chart (from DB)")
     px = get_prices_from_db(sel_sym, sel_ex)
     if px.empty:
-        st.warning("No DB price rows yet. Run GitHub Actions after watchlist.csv is synced to GitHub.")
+        st.warning("Still no DB prices. Click refresh once (it now stores prices into DB).")
     else:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=px["date"], y=px["close"], mode="lines", name="Price"))
